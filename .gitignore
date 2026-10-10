@@ -1,0 +1,24 @@
+/target
+node_modules
+dist
+.DS_Store
+*.part
+__pycache__/
+
+# Local configuration, recordings, and downloaded models
+.env
+.env.*
+/settings.json
+/data/
+/models/
+/notes/
+/audio/
+/pending/
+/logs/
+*.gguf
+*.wav
+*.aiff
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+/validation-results.json
