@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod config;
+pub mod content;
 pub mod context;
 pub mod explore;
 pub mod history;
@@ -244,49 +245,29 @@ impl Service {
         id: String,
     ) -> Result<Option<Transcript>> {
         let duration = samples.len() as f64 / 16000.0;
-        let audio_path = if settings.retain_audio {
-            let path = self.paths.root.join("audio").join(format!("{id}.wav"));
-            audio::write_wav(&path, &samples)?;
-            Some(path.to_string_lossy().into_owned())
-        } else {
-            None
-        };
         let engine = self.engine.clone();
         let opts = settings.clone();
-        let raw =
-            tokio::task::spawn_blocking(move || engine.lock().unwrap().transcribe(&samples, &opts))
-                .await??;
+        let (raw, samples) = tokio::task::spawn_blocking(move || {
+            let raw = engine.lock().unwrap().transcribe(&samples, &opts)?;
+            anyhow::Ok((raw, samples))
+        })
+        .await??;
         if raw.is_empty() {
             self.activity(format!(
                 "Segment {id}: no speech text recognized; no note saved"
             ));
             return Ok(None);
         }
-        // Persist raw speech BEFORE cleanup, so a failed/slow LLM cannot lose the transcript.
-        let mut entry = Transcript {
-            id,
-            created_at: created_at.to_rfc3339(),
-            refined: raw.clone(),
-            raw: raw.clone(),
-            speech_model: settings.speech_model.clone(),
-            filter_model: settings
-                .filter_enabled
-                .then_some(settings.filter_model.clone()),
-            duration_seconds: duration,
-            audio_path,
-            filter_error: None,
-        };
-        history::History::open(&self.paths)?.insert(&entry)?;
-        self.activity(format!(
-            "Segment {}: transcription saved to {}; text: {}",
-            entry.id,
-            history::note_path(&self.paths, &entry.created_at)?.display(),
-            serde_json::to_string(&raw)?
-        ));
+        if content::should_skip(&raw, settings.short_transcript_policy) {
+            self.activity(format!(
+                "Segment {id}: short transcript skipped; no note or audio saved"
+            ));
+            return Ok(None);
+        }
         if settings.filter_enabled {
             self.activity(format!(
-                "Segment {}: cleaning up transcript with {}",
-                entry.id, settings.filter_model
+                "Segment {id}: cleaning up transcript with {}",
+                settings.filter_model
             ));
         }
         let refined = self.refine(&raw, settings.clone()).await;
@@ -300,11 +281,37 @@ impl Service {
                 (raw.clone(), Some(message))
             }
         };
-        entry.refined = refined;
-        entry.filter_error = filter_error;
-        if settings.filter_enabled {
-            history::History::open(&self.paths)?.update(&entry)?;
+        if filter_error.is_none()
+            && content::should_skip(&refined, settings.short_transcript_policy)
+        {
+            self.activity(format!(
+                "Segment {id}: cleaned transcript discarded; no note or audio saved"
+            ));
+            return Ok(None);
         }
+        // Queued recording jobs remain recoverable until this entire operation succeeds.
+        // Save original and cleaned text together after the model decides what remains.
+        let audio_path = if settings.retain_audio {
+            let path = self.paths.root.join("audio").join(format!("{id}.wav"));
+            audio::write_wav(&path, &samples)?;
+            Some(path.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        let entry = Transcript {
+            id,
+            created_at: created_at.to_rfc3339(),
+            refined,
+            raw,
+            speech_model: settings.speech_model.clone(),
+            filter_model: settings
+                .filter_enabled
+                .then_some(settings.filter_model.clone()),
+            duration_seconds: duration,
+            audio_path,
+            filter_error,
+        };
+        history::History::open(&self.paths)?.insert(&entry)?;
         self.log_processed(&entry);
         let _ = self.events.send(Event::Transcript {
             entry: entry.clone(),

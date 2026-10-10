@@ -71,7 +71,7 @@ The next step is to connect my project notes.
 
 Dates and readable times follow the laptop's local timezone. The precise start timestamp is in an HTML comment for downstream indexing. A segment crossing midnight belongs to its start date. Times are captured before inference, so a slow model doesn't shift a note to the time it finished processing.
 
-Files are updated automatically after each transcription, **before** optional cleanup. If cleanup is enabled, the cleaned text replaces the visible entry and the complete original remains in a collapsible section. The Markdown files are generated from the index: put hand edits in separate files or use **Add note**; editing a generated daily file directly will be overwritten when that day is updated.
+Files are updated after transcription and optional cleanup finish. By default, empty cleanup output is discarded before saving; accepted entries preserve both the original and cleaned text. The original appears in a collapsible section when it differs. Cleanup failures save the original and report the error. Completed recording jobs stay in the durable queue until processing and persistence succeed. The Markdown files are generated from the index: put hand edits in separate files or use **Add note**; editing a generated daily file directly will be overwritten when that day is updated.
 
 On first launch, `contextd start` (or bare `contextd`) starts setup and asks whether to keep processed audio clips. Clips are off by default; when enabled, processed WAVs are stored under `audio/`. Pending segments are temporary and removed after processing. `start` runs continuously in the foreground, with audio processing alongside capture.
 
@@ -206,7 +206,7 @@ Before: Um, ship this Tuesday, no, Wednesday, with the new design.
 After:  Ship this Wednesday with the new design.
 ```
 
-Model quality varies; the original transcript is always preserved. S1-mini passed 11/13 strict local cleanup cases in an earlier runtime evaluation; this is an application fixture, not a general accuracy benchmark. It can still collapse intentional emphasis. If model loading fails or output is truncated, the raw transcript remains saved and the error is shown. S1-mini's empty output for pure filler is valid, with the original still retained. See [model research and evaluation](docs/CLEANUP_MODEL_RESEARCH.md) for sources, cases, and limitations.
+Model quality varies; accepted entries preserve the original transcript. S1-mini passed 11/13 strict local cleanup cases in an earlier runtime evaluation; this is an application fixture, not a general accuracy benchmark. It can still collapse intentional emphasis. If model loading fails or output is truncated, the raw transcript remains saved and the error is shown. S1-mini's empty output for pure filler is valid; these segments are discarded by default. See [model research and evaluation](docs/CLEANUP_MODEL_RESEARCH.md) for sources, cases, and limitations.
 
 Model downloads need internet access; speech and cleanup inference stay on the laptop.
 
@@ -224,6 +224,7 @@ The `idle_unload_seconds` setting controls both engines:
 - Default pause boundary: 1.4 seconds; maximum segment: 30 seconds.
 - A 300 ms preroll helps retain the beginning of speech; very brief noise is discarded.
 - Completed segments are queued on disk while inference catches up. Failed jobs remain for retry on the next recording start. Temporary pending audio is removed after successful processing even when **Keep audio clips** is off.
+- Empty output from the cleanup model is discarded before saving, with no word or phrase blacklist. Set `short_transcript_policy` to `skip_all` to discard every 1–3-word transcript, or `keep` to disable filtering; see [configuration](docs/CONFIGURATION.md#skip-brief-filler).
 - Raw WAV clips can optionally be retained alongside text. Deleting a memory removes its retained clip and updates the daily file.
 
 This captures microphone audio, including voices/background sounds reaching that microphone. It does not capture system audio, screens, or identify speakers. Energy detection may need threshold tuning for a noisy room or quiet voice. Suspend/sleep pauses the OS's audio capture; the app cannot record while the laptop sleeps. Abrupt termination can lose the currently unfinished segment; completed queued segments are recoverable.

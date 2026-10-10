@@ -6,6 +6,16 @@ pub const PRODUCT_NAME: &str = "contextd";
 pub const DATA_HOME_ENV: &str = "CONTEXTD_HOME";
 const LEGACY_DATA_HOME_ENV: &str = "RECORD_EVERYTHING_HOME";
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortTranscriptPolicy {
+    Keep,
+    #[default]
+    #[serde(alias = "skip_filler")]
+    Cleanup,
+    SkipAll,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -19,6 +29,7 @@ pub struct Settings {
     pub max_segment_seconds: u64,
     pub speech_threshold: f32,
     pub retain_audio: bool,
+    pub short_transcript_policy: ShortTranscriptPolicy,
 }
 
 impl Default for Settings {
@@ -34,6 +45,7 @@ impl Default for Settings {
             max_segment_seconds: 30,
             speech_threshold: 0.012,
             retain_audio: false,
+            short_transcript_policy: ShortTranscriptPolicy::default(),
         }
     }
 }
