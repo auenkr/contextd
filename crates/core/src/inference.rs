@@ -7,7 +7,7 @@ use llama_cpp_2::{
     model::{params::LlamaModelParams, LlamaModel},
 };
 use std::time::Instant;
-use transcribe_cpp::{Model, RunOptions};
+use transcribe_cpp::{Model, RunOptions, StreamOptions};
 
 fn configure_native_logging() {
     static INIT: std::sync::Once = std::sync::Once::new();
@@ -29,6 +29,29 @@ fn s1_prompt(text: &str) -> String {
     format!("<|im_start|>system\n{S1_SYSTEM_PROMPT}<|im_end|>\n\
         <|im_start|>user\n[Styling: semi-formal] [Structure: prose] [Context: general]\n{text}<|im_end|>\n\
         <|im_start|>assistant\n<think>\n\n</think>\n\n")
+}
+
+// Prefer a sentence/paragraph boundary near the middle. Fall back to whitespace
+// and then a UTF-8 boundary so even one enormous word can be split safely.
+fn cleanup_split(text: &str) -> Option<(&str, &str)> {
+    let middle = text.len() / 2;
+    let candidates = |sentences_only: bool| {
+        text.char_indices()
+            .filter_map(move |(i, c)| {
+                (i > 0
+                    && c.is_whitespace()
+                    && (!sentences_only || c == '\n' || text[..i].ends_with(['.', '!', '?'])))
+                .then_some(i)
+            })
+            .min_by_key(|i| i.abs_diff(middle))
+    };
+    let index = candidates(true).or_else(|| candidates(false)).or_else(|| {
+        text.char_indices()
+            .map(|(i, _)| i)
+            .filter(|i| *i > 0)
+            .min_by_key(|i| i.abs_diff(middle))
+    })?;
+    Some(text.split_at(index))
 }
 
 pub trait SpeechToText: Send {
@@ -84,7 +107,27 @@ impl SpeechToText for LocalSpeechEngine {
             },
             ..Default::default()
         };
-        let text = session.run(samples, &options)?.text;
+        // Keep one recognition session across long utterances. Streaming models
+        // bound their internal audio windows without creating note boundaries.
+        // Short utterances retain the existing whole-buffer recognition path.
+        let text = if samples.len() > 30 * 16000
+            && self
+                .loaded
+                .as_ref()
+                .unwrap()
+                .1
+                .capabilities()
+                .supports_streaming
+        {
+            let mut stream = session.stream(&options, &StreamOptions::default())?;
+            for chunk in samples.chunks(16000) {
+                stream.feed(chunk)?;
+            }
+            stream.finalize()?;
+            stream.snapshot().text
+        } else {
+            session.run(samples, &options)?.text
+        };
         self.last_used = Instant::now();
         Ok(text.trim().to_owned())
     }
@@ -138,8 +181,13 @@ impl LocalCleanupEngine {
         )?;
         let vocab = model.vocab();
         let input = vocab.tokenize(s1_prompt(text).as_bytes(), true, true);
-        if input.len() >= context.n_ctx() as usize {
-            bail!("Transcript is too long for the cleanup model; original preserved");
+        // Input and output share the context. Reserve enough room for a cleaned
+        // transcript of similar length, including the fixed prompt overhead.
+        let prompt_tokens = vocab.tokenize(s1_prompt("").as_bytes(), true, true).len();
+        let transcript_tokens = input.len().saturating_sub(prompt_tokens);
+        if input.len() + transcript_tokens + 128 >= context.n_ctx() as usize {
+            drop(context);
+            return self.refine_chunks(paths, settings, text);
         }
         let mut batch = LlamaBatch::new(input.len().max(1), 1);
         for (position, token) in input.iter().enumerate() {
@@ -161,12 +209,25 @@ impl LocalCleanupEngine {
             position += 1;
         }
         if position >= context.n_ctx() as usize {
-            bail!("Cleanup output was truncated; original preserved");
+            drop(context);
+            return self.refine_chunks(paths, settings, text);
         }
         let cleaned = String::from_utf8_lossy(&output).trim().to_owned();
         self.last_used = Instant::now();
         // S1-mini intentionally returns empty text for filler-only input.
         Ok(cleaned)
+    }
+
+    fn refine_chunks(&mut self, paths: &Paths, settings: &Settings, text: &str) -> Result<String> {
+        let (left, right) = cleanup_split(text)
+            .context("Cleanup cannot fit even the smallest input; original preserved")?;
+        let left = self.refine(paths, settings, left.trim())?;
+        let right = self.refine(paths, settings, right.trim())?;
+        Ok([left, right]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"))
     }
 
     pub fn unload_if_idle(&mut self, seconds: u64) -> bool {
@@ -202,6 +263,21 @@ fn gpu_layers() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_split_preserves_text_and_prefers_sentence_boundaries() {
+        let text = "First thought. The next thought continues with more detail.";
+        let (left, right) = cleanup_split(text).unwrap();
+        assert_eq!(left, "First thought.");
+        assert_eq!(format!("{left}{right}"), text);
+        for text in ["你好世界", "averylongword", "one two three four"] {
+            let (left, right) = cleanup_split(text).unwrap();
+            assert!(!left.is_empty());
+            assert!(!right.is_empty());
+            assert_eq!(format!("{left}{right}"), text);
+        }
+        assert!(cleanup_split("a").is_none());
+    }
     #[test]
     fn s1_prompt_keeps_the_model_training_format() {
         let prompt = s1_prompt("Ship Tuesday, no, Wednesday");

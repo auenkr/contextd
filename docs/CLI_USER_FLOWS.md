@@ -102,7 +102,7 @@ contextd config > settings.json
 contextd config --file settings.json
 ```
 
-Useful fields: `microphone`, `silence_ms`, `speech_threshold`, `max_segment_seconds`, `retain_audio`, `idle_unload_seconds`.
+Useful fields: `microphone`, `silence_ms`, `speech_threshold`, `retain_audio`, `idle_unload_seconds`. Continuous sound is no longer split on a timer.
 
 **Checkpoint:** settings persist. Invalid values and unknown speech models fail. Idle models unload (reported with `--verbose`); new speech reloads them. `0` keeps them loaded. Missing JSON fields use defaults, so begin with a complete exported config when preserving existing choices matters.
 

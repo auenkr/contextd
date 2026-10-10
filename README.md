@@ -221,7 +221,9 @@ The `idle_unload_seconds` setting controls both engines:
 ## Recording behavior
 
 - Selected microphone, mono 16 kHz streaming resampling, energy-based segmentation.
-- Default pause boundary: 1.4 seconds; maximum segment: 30 seconds.
+- Default pause boundary: 1.4 seconds. Continuous sound stays in one segment until a pause or recording stops; there is no timed cutoff.
+- Recognition runs after that boundary. For audio longer than 30 seconds, streaming-capable models use one streaming recognition session with internal audio windows; these do not split the saved entry or trigger cleanup. Other models use their whole-buffer recognition path. Active audio stays in memory until the pause, then enters the durable processing queue.
+- Cleanup receives the complete transcript when it fits its 4,096-token context (including prompt and output). Longer transcripts are split near sentence/paragraph boundaries and cleaned parts are saved together as one entry.
 - A 300 ms preroll helps retain the beginning of speech; very brief noise is discarded.
 - Completed segments are queued on disk while inference catches up. Failed jobs remain for retry on the next recording start. Temporary pending audio is removed after successful processing even when **Keep audio clips** is off.
 - Empty output from the cleanup model is discarded before saving, with no word or phrase blacklist. Set `short_transcript_policy` to `skip_all` to discard every 1–3-word transcript, or `keep` to disable filtering; see [configuration](docs/CONFIGURATION.md#skip-brief-filler).

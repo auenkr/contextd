@@ -458,7 +458,7 @@ impl Service {
                         if let Some(segment) = segmenter.push(&samples) {
                             service.enqueue(segment, &settings, &segments_tx);
                         } else if !was_active && segmenter.is_active() {
-                            service.activity("Speech detected; collecting audio until a pause or the segment limit");
+                            service.activity("Speech detected; collecting audio until a pause");
                         }
                     }
                 }

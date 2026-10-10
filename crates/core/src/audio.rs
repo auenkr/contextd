@@ -295,9 +295,7 @@ impl Segmenter {
         } else {
             self.silence += samples.len();
         }
-        if self.silence >= self.settings.silence_ms as usize * 16
-            || self.samples.len() >= self.settings.max_segment_seconds as usize * 16000
-        {
+        if self.silence >= self.settings.silence_ms as usize * 16 {
             return self.flush();
         }
         None
@@ -390,5 +388,20 @@ mod tests {
         }
         assert!(segment.unwrap().samples.len() <= 35200);
         assert!(segmenter.flush().is_none());
+    }
+
+    #[test]
+    fn continuous_sound_stays_in_one_segment_until_a_pause() {
+        let mut segmenter = Segmenter::new(Settings::default());
+        for _ in 0..650 {
+            assert!(segmenter.push(&[0.1; 1600]).is_none());
+        }
+        assert!(segmenter.is_active());
+        for _ in 0..13 {
+            assert!(segmenter.push(&[0.0; 1600]).is_none());
+        }
+        let segment = segmenter.push(&[0.0; 1600]).unwrap();
+        assert_eq!(segment.samples.len(), 664 * 1600);
+        assert!(!segmenter.is_active());
     }
 }

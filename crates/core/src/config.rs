@@ -26,7 +26,6 @@ pub struct Settings {
     pub language: String,
     pub idle_unload_seconds: u64,
     pub silence_ms: u64,
-    pub max_segment_seconds: u64,
     pub speech_threshold: f32,
     pub retain_audio: bool,
     pub short_transcript_policy: ShortTranscriptPolicy,
@@ -42,7 +41,6 @@ impl Default for Settings {
             language: "auto".into(),
             idle_unload_seconds: 120,
             silence_ms: 1400,
-            max_segment_seconds: 30,
             speech_threshold: 0.012,
             retain_audio: false,
             short_transcript_policy: ShortTranscriptPolicy::default(),
@@ -53,7 +51,6 @@ impl Default for Settings {
 impl Settings {
     pub fn validate(&self) -> Result<()> {
         if !(300..=5000).contains(&self.silence_ms)
-            || !(5..=60).contains(&self.max_segment_seconds)
             || !self.speech_threshold.is_finite()
             || !(0.001..=0.2).contains(&self.speech_threshold)
             || self.idle_unload_seconds > 86400

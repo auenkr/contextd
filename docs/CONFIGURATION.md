@@ -26,7 +26,7 @@ Export the complete configuration before editing: omitted fields receive default
 | `retain_audio` | `false` | Keep completed WAV clips in `audio/`. |
 | `speech_threshold` | `0.012` | RMS energy threshold, allowed range `0.001`–`0.2`. Lower it for quieter speech. |
 | `silence_ms` | `1400` | Pause that ends a segment, allowed range `300`–`5000` ms. |
-| `max_segment_seconds` | `30` | Segment limit during continuous speech, allowed range `5`–`60` seconds. |
+| `max_segment_seconds` (legacy) | Ignored | Old configurations may contain this field. Continuous sound now ends only at a pause or when recording stops. |
 | `idle_unload_seconds` | `120` | Release idle models; `0` keeps them loaded, maximum `86400`. |
 
 Model selection and microphone flags persist:
