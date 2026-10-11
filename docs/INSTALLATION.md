@@ -89,3 +89,15 @@ Detach with Ctrl+B, then D. Return with `tmux attach -t contextd`. The computer 
 | Storage migration conflict | Stop recording and inspect both locations. Migration preserves existing destination files instead of overwriting them. Use `--data-dir` to access a legacy portable installation. |
 
 For bug reports, include OS, `rustc --version`, `contextd --version`, the command, and the relevant error. Remove personal transcript text from any logs you share.
+
+## Local speaker models
+
+Speaker detection is enabled by default. Automatic setup requires `uv` on PATH (`brew install uv` on macOS). On first use, contextd creates a Python 3.12 environment with sherpa-onnx, NumPy and certifi, then downloads the segmentation and embedding models. Later inference runs locally from the cache. Alternatively, set `speaker_python` to an absolute Python executable with these packages installed. A setup failure records a speaker error but still saves the transcription. See [speaker processing](SPEAKERS.md).
+
+To exercise actual diarization, profile samples, matching across worker restarts, and transcription with isolated data:
+
+```sh
+CONTEXTD_HOME="$(mktemp -d)" cargo run -p contextd-core --example speaker_smoke
+```
+
+The command creates a fresh validation directory. It downloads public test audio and speech/speaker models, writes profiles and notes, and names test speakers. It should only be run against isolated validation data.

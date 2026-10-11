@@ -38,11 +38,18 @@ const SETTINGS_ORDER: &[&str] = &[
     "microphones",
     "microphone",
     "record_device_audio",
+    "speaker_detection_enabled",
+    "speaker_match_threshold",
+    "speaker_match_margin",
     "preferred_language",
     "language",
     "filter_enabled",
     "filter_model",
     "output_language",
+    "daily_structure_enabled",
+    "daily_structure_model",
+    "daily_group_gap_minutes",
+    "transcription_retention_days",
     "editor_mode",
     "retain_audio",
     "silence_ms",
@@ -56,6 +63,7 @@ const SETTINGS_ORDER: &[&str] = &[
     "data_directory",
     "logs_directory",
     "mlx_python",
+    "speaker_python",
 ];
 
 fn setting_value(
@@ -96,6 +104,17 @@ fn setting_value(
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|e| e.to_string())
         }),
+        "speaker_python" => settings
+            .speaker_python
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| {
+                paths
+                    .cache_dir
+                    .join("speaker-runtime/venv/bin/python")
+                    .display()
+                    .to_string()
+            }),
         "mlx_python" => settings
             .mlx_python
             .as_ref()
@@ -178,6 +197,14 @@ fn setting_info(key: &str) -> (&str, &str) {
         "editor_mode" => ("Notes editor controls", "Normal: arrows move and typing edits immediately. Vim: h/j/k/l move, i/a/o enter insert mode, Esc returns to navigation. Ctrl+s saves in either mode. Originals remain intact."),
         "cleanup_backend" => ("Cleanup engine", "Auto chooses the engine from the model. GGUF runs locally through llama.cpp. MLX requires Apple Silicon macOS. Changing this can select a compatible cleanup model."),
         "short_transcript_policy" => ("Short transcripts", "Decide what to do with very short speech: preserve it, clean it, or discard it."),
+        "daily_structure_enabled" => ("Structure completed days", "Organize past days automatically after midnight or on next launch; original text is preserved in the final structured file."),
+        "daily_structure_model" => ("Daily structuring model", "A separate GGUF instruction model groups related notes. Default: qwen2.5-1.5b-instruct. Downloaded when first needed; S1-mini cannot structure days."),
+        "daily_group_gap_minutes" => ("Separate discussions after a long pause", "Start a new discussion after this many minutes without notes. Default: 30; 0 disables time-based splitting. Three-to-five-minute pauses stay eligible for grouping."),
+        "transcription_retention_days" => ("Transcription file retention", "Delete original daily Markdown after this many local calendar days, only after successful structuring. Default: 7; 0 keeps files indefinitely. The searchable database is retained."),
+        "speaker_detection_enabled" => ("Speaker detection", "Detect speaker turns locally, remember voices, and save a short sample for each new voice even when full audio retention is off. Name them in Speakers."),
+        "speaker_match_threshold" => ("Voice match confidence", "Cosine similarity required to reuse a saved speaker. Default: 0.90; higher values are stricter. Allowed: 0.3–0.95."),
+        "speaker_match_margin" => ("Voice match ambiguity margin", "Require this difference between the best and next-best profile. Default: 0.04. Close or borderline matches stay unknown. Allowed: 0–0.3."),
+        "speaker_python" => ("Speaker runtime Python", "Optional absolute Python path with sherpa-onnx 1.13.8, numpy, and certifi. Otherwise uv creates a cached Python 3.12 environment automatically."),
         "filter_enabled" => ("Transcript cleanup", "Remove fillers and repetitions after recognition. Original transcripts are preserved; cleanup needs a downloaded model."),
         "record_device_audio" => ("Record device audio", "Off by default. On captures system output alongside microphone inputs as a separate source. Supported on macOS 13+; allow Screen & System Audio Recording for your terminal. No screen video is saved. Applies when recording restarts."),
         "retain_audio" => ("Keep audio recordings", "Off saves text without retaining completed audio recordings. On keeps recordings alongside transcripts and uses more disk space."),
@@ -224,9 +251,60 @@ fn setting_choices(key: &str) -> Vec<Choice> {
             ),
             ("skip_all", "Skip all", "Discard all short transcripts"),
         ],
-        "filter_enabled" | "retain_audio" | "record_device_audio" => {
+        "filter_enabled"
+        | "retain_audio"
+        | "record_device_audio"
+        | "daily_structure_enabled"
+        | "speaker_detection_enabled" => {
             vec![("false", "Off", "Disabled"), ("true", "On", "Enabled")]
         }
+        "daily_structure_model" => vec![
+            (
+                "qwen2.5-1.5b-instruct",
+                "Qwen 2.5 1.5B",
+                "Default multilingual instruction model · about 1.1 GB",
+            ),
+            (
+                "qwen3.5:0.8b",
+                "Qwen 3.5 0.8B",
+                "Smaller multilingual instruction model · about 533 MB",
+            ),
+            (
+                "qwen3-4b-instruct-2507",
+                "Qwen 3 4B",
+                "Larger multilingual instruction model · about 2.5 GB",
+            ),
+        ],
+        "daily_group_gap_minutes" => vec![
+            (
+                "30",
+                "30 minutes",
+                "Default; separate later sessions while grouping short meeting pauses",
+            ),
+            ("15", "15 minutes", "Split after shorter breaks"),
+            ("60", "60 minutes", "Allow longer gaps within a discussion"),
+            ("0", "Model decides", "Disable time-based splitting"),
+        ],
+        "transcription_retention_days" => vec![
+            ("7", "7 days", "Default transcription file retention"),
+            ("14", "14 days", "Keep transcription files for two weeks"),
+            ("30", "30 days", "Keep transcription files for thirty days"),
+            (
+                "0",
+                "Keep forever",
+                "Never delete transcription files automatically",
+            ),
+        ],
+        "speaker_match_threshold" => vec![
+            ("0.9", "Strict · 0.90", "Default"),
+            ("0.8", "Moderate · 0.80", "Accept less similar recordings"),
+            ("0.6", "Relaxed · 0.60", "More matches; review carefully"),
+        ],
+        "speaker_match_margin" => vec![
+            ("0.04", "Balanced · 0.04", "Default ambiguity margin"),
+            ("0.12", "Strict · 0.12", "More unknown matches"),
+            ("0.02", "Relaxed · 0.02", "Accept closer candidates"),
+        ],
         "silence_ms" => vec![
             ("600", "Quick · 600 ms", "Save soon after a pause"),
             (
@@ -271,6 +349,8 @@ fn setting_choices(key: &str) -> Vec<Choice> {
         "cleanup_backend"
             | "short_transcript_policy"
             | "filter_enabled"
+            | "daily_structure_enabled"
+            | "speaker_detection_enabled"
             | "retain_audio"
             | "record_device_audio"
             | "editor_mode"
@@ -909,6 +989,7 @@ pub fn run(
                     model.id == settings.speech_model
                 } else {
                     model.id == models::canonical_cleanup_id(&settings.filter_model)
+                        || model.id == settings.daily_structure_model
                 };
                 if selected_model {
                     message = format!(

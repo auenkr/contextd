@@ -11,6 +11,7 @@ mod downloads;
 mod editor;
 mod explore;
 mod home;
+mod speakers;
 mod tui;
 
 #[derive(Parser)]
@@ -42,6 +43,13 @@ struct Args {
 enum Command {
     /// Browse saved notes and play retained audio in the terminal.
     Explore,
+    /// Listen to saved voice samples and name speakers.
+    Speakers {
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<SpeakerCommand>,
+    },
     /// List microphone IDs for config or --microphone.
     Microphones,
     /// Show the resolved config, data, cache, and log directories.
@@ -97,7 +105,23 @@ enum Command {
         #[arg(long)]
         record: bool,
     },
+    /// Organize completed days into lossless structured Markdown (catch up by default).
+    Structure {
+        /// Completed local date, YYYY-MM-DD. Omit to process all missed dates.
+        #[arg(long)]
+        date: Option<chrono::NaiveDate>,
+        /// Regenerate even if the source notes have not changed.
+        #[arg(long)]
+        force: bool,
+    },
     Unload,
+}
+#[derive(Subcommand)]
+enum SpeakerCommand {
+    /// Rename a voice and synchronize its name in existing notes.
+    Name { id: String, name: String },
+    /// Retry interrupted name synchronization.
+    Sync,
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -122,6 +146,7 @@ async fn main() -> Result<()> {
     let downloads =
         crate::downloads::Downloads::new(service.clone(), tokio::runtime::Handle::current());
     if args.command.is_none() {
+        service.start_daily_worker();
         let runtime = tokio::runtime::Handle::current();
         let dashboard_service = service.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -203,6 +228,24 @@ async fn main() -> Result<()> {
             None => unreachable!("dashboard is handled above"),
             Some(command) => match command {
                 Command::Explore => unreachable!("explore is handled before service startup"),
+                Command::Speakers { json, action } => match action {
+                    Some(SpeakerCommand::Name { id, name }) => {
+                        let paths = service.paths.clone();
+                        let settings = service.settings();
+                        tokio::task::spawn_blocking(move || contextd_core::speakers::rename(&paths,&settings,&id,&name)).await??;
+                        println!("Speaker name saved and notes synchronized");
+                    },
+                    Some(SpeakerCommand::Sync) => {
+                        let paths = service.paths.clone();
+                        let settings = service.settings();
+                        tokio::task::spawn_blocking(move || contextd_core::speakers::sync_names(&paths,&settings)).await??;
+                        println!("Speaker names synchronized");
+                    },
+                    None if json || !io::stdin().is_terminal() || !io::stdout().is_terminal() => {
+                        println!("{}",serde_json::to_string_pretty(&contextd_core::speakers::list(&service.paths)?)?);
+                    },
+                    None => { let paths = service.paths.clone(); tokio::task::spawn_blocking(move || speakers::run(paths)).await??; }
+                },
                 Command::Microphones => {
                     println!("{}", serde_json::to_string_pretty(&audio::microphones()?)?)
                 }
@@ -218,7 +261,7 @@ async fn main() -> Result<()> {
                 Command::RemoveModel { id } => {
                     let settings = service.settings();
                     let id = models::canonical_cleanup_id(&id);
-                    if id == settings.speech_model || id == models::canonical_cleanup_id(&settings.filter_model) {
+                    if id == settings.speech_model || id == models::canonical_cleanup_id(&settings.filter_model) || id == settings.daily_structure_model {
                         anyhow::bail!("Select another model before deleting the selected cache");
                     }
                     models::delete(&service.paths, id)?;
@@ -293,8 +336,12 @@ async fn main() -> Result<()> {
                     }
                 }
                 Command::Delete { id } => service.delete(&id)?,
+                Command::Structure { date, force } => {
+                    for path in service.structure_days(date, force).await? { println!("{}", path.display()); }
+                }
                 Command::Unload => service.unload().await?,
                 Command::Serve { port, record } => {
+                    service.start_daily_worker();
                     if record {
                         service.start().await?;
                     }
@@ -342,6 +389,9 @@ fn print_event(event: Event, last_progress: &mut (String, u64), verbose: bool) {
                 })
                 .unwrap_or_else(|_| log.started_at.clone());
             eprintln!("\n[{speech_time}]");
+            if !log.speakers.is_empty() {
+                eprintln!("  Speakers: {}", log.speakers.join(", "));
+            }
             if verbose {
                 eprintln!("  Processed: {} ({})", log.processed_at, log.id);
             }

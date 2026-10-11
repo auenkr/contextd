@@ -24,6 +24,52 @@ pub struct Transcript {
     pub filter_error: Option<String>,
     #[serde(default)]
     pub microphone: Option<String>,
+    #[serde(default)]
+    pub speaker_turns: Vec<crate::speakers::SpeakerTurn>,
+    #[serde(default)]
+    pub speaker_error: Option<String>,
+}
+
+pub fn search_text(entry: &Transcript) -> String {
+    let mut text = entry.refined.clone();
+    for turn in &entry.speaker_turns {
+        text.push_str(&format!("\n{}\n{}", turn.speaker_name, turn.refined));
+    }
+    text
+}
+
+/// Attribution is additional to the complete saved transcript, never a replacement.
+pub fn speaker_markdown(entry: &Transcript) -> String {
+    if entry.speaker_turns.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from("\n**Speakers**\n\n");
+    let base = chrono::DateTime::parse_from_rfc3339(&entry.created_at).ok();
+    for turn in &entry.speaker_turns {
+        let start = base
+            .map(|time| {
+                (time + chrono::Duration::milliseconds((turn.start_seconds * 1000.0) as i64))
+                    .with_timezone(&chrono::Local)
+                    .format("%-I:%M:%S %p")
+                    .to_string()
+            })
+            .unwrap_or_else(|| format!("{:.1}s", turn.start_seconds));
+        let name = turn.speaker_name.replace(['\n', '\r', '*', '<', '>'], " ");
+        text.push_str(&format!(
+            "**{} · {}**{}\n\n",
+            name,
+            start,
+            if turn.overlap {
+                " · overlapping speech"
+            } else {
+                ""
+            }
+        ));
+        if entry.speaker_turns.len() > 1 {
+            text.push_str(&format!("{}\n\n", turn.refined));
+        }
+    }
+    text
 }
 
 pub struct History(Connection, Paths);
@@ -46,7 +92,13 @@ impl History {
         Ok(Self(conn, paths.clone()))
     }
     pub fn insert(&self, transcript: &Transcript) -> Result<()> {
-        let tx = self.0.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.0,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let mut current = transcript.clone();
+        crate::speakers::resolve_names(&tx, &mut current)?;
+        let transcript = &current;
         tx.execute(
             "INSERT INTO transcripts VALUES (?1, ?2, ?3) ON CONFLICT(id) DO UPDATE SET document = excluded.document",
             params![
@@ -58,7 +110,7 @@ impl History {
         tx.execute("DELETE FROM memory_fts WHERE id = ?1", [&transcript.id])?;
         tx.execute(
             "INSERT INTO memory_fts(id, text) VALUES (?1, ?2)",
-            params![transcript.id, transcript.refined],
+            params![transcript.id, search_text(transcript)],
         )?;
         tx.commit()?;
         self.sync_day(&transcript.created_at)?;
@@ -78,6 +130,21 @@ impl History {
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
+    pub fn completed_days(&self, today: chrono::NaiveDate) -> Result<Vec<chrono::NaiveDate>> {
+        let mut statement = self
+            .0
+            .prepare("SELECT DISTINCT date(created_at, 'localtime') FROM transcripts ORDER BY 1")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut days = Vec::new();
+        for row in rows {
+            let day = chrono::NaiveDate::parse_from_str(&row?, "%Y-%m-%d")?;
+            if day < today {
+                days.push(day);
+            }
+        }
+        Ok(days)
+    }
+
     pub fn for_day(&self, day: chrono::NaiveDate) -> Result<Vec<Transcript>> {
         let lower = day.and_hms_opt(0, 0, 0).unwrap().and_utc() - chrono::Duration::days(1);
         let upper = lower + chrono::Duration::days(3);
@@ -99,6 +166,25 @@ impl History {
             }
         }
         Ok(entries)
+    }
+
+    /// Hold the SQLite writer lock while publishing a view of this exact snapshot.
+    pub(crate) fn with_current_day(
+        &self,
+        day: chrono::NaiveDate,
+        expected: &[Transcript],
+        publish: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.0,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if serde_json::to_vec(&self.for_day(day)?)? != serde_json::to_vec(expected)? {
+            bail!("Notes changed during daily structuring; will retry");
+        }
+        publish()?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Save user edits without replacing the original or a concurrent edit.
@@ -126,7 +212,7 @@ impl History {
         )?;
         tx.execute(
             "UPDATE memory_fts SET text = ?2 WHERE id = ?1",
-            params![id, text],
+            params![id, search_text(&entry)],
         )?;
         tx.commit()?;
         self.sync_day(&entry.created_at)
@@ -157,13 +243,19 @@ impl History {
         )?;
         tx.execute(
             "UPDATE memory_fts SET text = ?2 WHERE id = ?1",
-            params![transcript.id, transcript.refined],
+            params![transcript.id, search_text(transcript)],
         )?;
         tx.commit()?;
         self.sync_day(&transcript.created_at)
     }
     /// Atomic Markdown replacement under a cross-process lock.
     pub fn sync_day(&self, created_at: &str) -> Result<()> {
+        self.sync_day_inner(created_at, true)
+    }
+    pub(crate) fn sync_day_preserving_structure(&self, created_at: &str) -> Result<()> {
+        self.sync_day_inner(created_at, false)
+    }
+    fn sync_day_inner(&self, created_at: &str, invalidate: bool) -> Result<()> {
         use fs2::FileExt;
         let day = chrono::DateTime::parse_from_rfc3339(created_at)?
             .with_timezone(&chrono::Local)
@@ -206,6 +298,7 @@ impl History {
                 entry.created_at,
                 entry.refined
             ));
+            text.push_str(&speaker_markdown(&entry));
             if let Some(microphone) = &entry.microphone {
                 let microphone = microphone.replace(['\r', '\n'], " ").replace('`', "\\`");
                 text.push_str(&format!("Source microphone: {microphone}\n\n"));
@@ -220,6 +313,14 @@ impl History {
         let temporary = directory.join(format!("{day}.md.part"));
         std::fs::write(&temporary, text)?;
         std::fs::rename(&temporary, note_path(&self.1, created_at)?)?;
+        let state = self
+            .1
+            .root
+            .join("structured")
+            .join(format!("{day}.source.json"));
+        if invalidate && state.exists() {
+            std::fs::remove_file(state)?;
+        }
         lock.unlock()?;
         Ok(())
     }
@@ -259,6 +360,8 @@ mod tests {
             speech_model: "qwen3-asr-0.6b".into(),
             filter_model: None,
             duration_seconds: 5.0,
+            speaker_turns: Vec::new(),
+            speaker_error: None,
             audio_path: Some("unchanged.wav".into()),
             filter_error: None,
             microphone: Some("Device audio · system output".into()),
@@ -309,6 +412,8 @@ mod tests {
             speech_model: "parakeet-unified-en-0.6b".into(),
             filter_model: None,
             duration_seconds: 5.0,
+            speaker_turns: Vec::new(),
+            speaker_error: None,
             audio_path: None,
             filter_error: None,
             microphone: None,
@@ -359,6 +464,8 @@ mod tests {
                     created_at: start.with_timezone(&chrono::Utc).to_rfc3339(),
                     raw: text.into(),
                     refined: text.into(),
+                    speaker_turns: Vec::new(),
+                    speaker_error: None,
                     speech_model: "manual-note".into(),
                     filter_model: None,
                     duration_seconds: 0.0,

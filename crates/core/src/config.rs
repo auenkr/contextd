@@ -41,6 +41,10 @@ pub struct Settings {
     pub speech_model: String,
     pub filter_model: String,
     pub filter_enabled: bool,
+    pub daily_structure_enabled: bool,
+    pub daily_structure_model: String,
+    pub daily_group_gap_minutes: u32,
+    pub transcription_retention_days: u32,
     pub language: String,
     pub preferred_language: String,
     pub output_language: String,
@@ -57,6 +61,10 @@ pub struct Settings {
     pub vad_threshold: f32,
     pub retain_audio: bool,
     pub record_device_audio: bool,
+    pub speaker_detection_enabled: bool,
+    pub speaker_match_threshold: f32,
+    pub speaker_match_margin: f32,
+    pub speaker_python: Option<PathBuf>,
     pub short_transcript_policy: ShortTranscriptPolicy,
 }
 
@@ -68,6 +76,10 @@ impl Default for Settings {
             speech_model: "parakeet-unified-en-0.6b".into(),
             filter_model: crate::models::DEFAULT_FILTER_MODEL.into(),
             filter_enabled: false,
+            daily_structure_enabled: true,
+            daily_structure_model: "qwen2.5-1.5b-instruct".into(),
+            daily_group_gap_minutes: 30,
+            transcription_retention_days: 7,
             language: "auto".into(),
             preferred_language: "auto".into(),
             output_language: "same".into(),
@@ -84,6 +96,10 @@ impl Default for Settings {
             vad_threshold: 0.6,
             retain_audio: false,
             record_device_audio: false,
+            speaker_detection_enabled: true,
+            speaker_match_threshold: 0.9,
+            speaker_match_margin: 0.04,
+            speaker_python: None,
             short_transcript_policy: ShortTranscriptPolicy::default(),
         }
     }
@@ -135,6 +151,24 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<()> {
+        crate::daily::validate_model(&self.daily_structure_model)?;
+        if self.daily_group_gap_minutes > 1440 {
+            bail!("Daily group gap must be 0–1440 minutes; 0 disables time-based splitting");
+        }
+        if !self.speaker_match_threshold.is_finite()
+            || !(0.3..=0.95).contains(&self.speaker_match_threshold)
+            || !self.speaker_match_margin.is_finite()
+            || !(0.0..=0.3).contains(&self.speaker_match_margin)
+        {
+            bail!("Speaker match threshold must be 0.3–0.95 and margin 0–0.3");
+        }
+        if self
+            .speaker_python
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            bail!("speaker_python must be an absolute path");
+        }
         let target = self.output_language.as_str();
         if target.is_empty()
             || matches!(target, "auto" | "hi-en")

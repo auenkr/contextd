@@ -197,3 +197,16 @@ The 13-pass report below is historical validation from before the move to in-pro
 Validation found and fixed cross-process configuration changes during capture, truncated exports at 10,000 entries, missing graceful SIGTERM handling, and missing CLI idle-unload visibility. The CLI's version banner now uses its command name. Cleanup received explicit self-correction examples; Qwen 3B passed, while the smaller 1.5B model still failed the correction-quality test.
 
 Additional checks passed: eight Rust unit tests (including S1-mini's exact protocol and empty-output handling), strict workspace Clippy (all targets), and TypeScript/Vite production build. The repeatable runner writes its full raw results to `<validation directory>/validation-results.json`.
+
+## Organize a completed day
+
+1. Keep the dashboard running across midnight, or launch it later to catch up.
+2. Open **Explore notes** and select the date: the final structured view groups related entries and preserves every original detail.
+3. Change **Config → Transcription file retention** to choose how long the original daily Markdown stays (default: 7 days; 0: forever).
+4. For a manual catch-up, run `contextd structure`; use `--date YYYY-MM-DD --force` to rebuild a completed date.
+
+Only successfully structured transcription files expire. Search and individual-note edits still use the retained index. [Details and validation](DAILY_STRUCTURING.md).
+
+## Name a speaker
+
+Open **Speakers** from the dashboard, select an unnamed voice, press Enter to play the sample, and press `n` to enter a name. Enter saves; Esc cancels. Past notes update and future confident matches reuse this name. Press `s` to stop playback and `q` to return. `contextd speakers --json` lists profiles; `contextd speakers name <id> "Name"` names one without opening the screen.

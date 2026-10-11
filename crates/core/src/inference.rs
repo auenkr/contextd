@@ -461,6 +461,65 @@ impl LocalCleanupEngine {
         Ok(cleaned)
     }
 
+    /// General instruction inference for lossless daily grouping. Separate from cleanup.
+    pub fn structure(&mut self, paths: &Paths, id: &str, text: &str) -> Result<String> {
+        crate::daily::validate_model(id)?;
+        let path = models::cleanup_path(paths, id)?;
+        if self.loaded.as_ref().map(|(loaded, _)| loaded) != Some(&path) {
+            self.unload();
+            let backend = LlamaBackend::init()?;
+            let model = LlamaModel::load_from_file(
+                &backend,
+                &path,
+                &LlamaModelParams::default().with_n_gpu_layers(gpu_layers()),
+            )?;
+            self.backend = Some(backend);
+            self.loaded = Some((path, model));
+        }
+        let model = &self.loaded.as_ref().unwrap().1;
+        let messages = [
+            llama_cpp_2::model::LlamaChatMessage::new(
+                "system".into(),
+                crate::daily::GROUPING_INSTRUCTION.into(),
+            )?,
+            llama_cpp_2::model::LlamaChatMessage::new("user".into(), text.into())?,
+        ];
+        let template = model.chat_template(None)?;
+        let mut prompt = model.apply_chat_template(&template, &messages, true)?;
+        if id.starts_with("qwen3.5") {
+            prompt.push_str("<think>\n\n</think>\n\n");
+        }
+        let vocab = model.vocab();
+        let input = vocab.tokenize(prompt.as_bytes(), false, true);
+        if input.len() + 1024 >= 8192 {
+            bail!("Daily grouping input exceeds model context; originals preserved");
+        }
+        let mut context = model.new_context(
+            self.backend.as_ref().unwrap(),
+            LlamaContextParams::default()
+                .with_n_ctx(std::num::NonZeroU32::new(8192))
+                .with_n_batch(8192),
+        )?;
+        let mut batch = LlamaBatch::new(input.len().max(1), 1);
+        for (position, token) in input.iter().enumerate() {
+            batch.add(*token, position as i32, &[0], position + 1 == input.len())?;
+        }
+        context.decode(&mut batch)?;
+        let mut output = Vec::new();
+        for position in input.len()..input.len() + 1024 {
+            let token = context.token_data_array().sample_token_greedy();
+            if vocab.is_eog(token) {
+                self.last_used = Instant::now();
+                return Ok(String::from_utf8_lossy(&output).trim().to_owned());
+            }
+            output.extend(vocab.token_to_piece(token, false, None));
+            batch.clear();
+            batch.add(token, position as i32, &[0], true)?;
+            context.decode(&mut batch)?;
+        }
+        bail!("Daily grouping output was truncated; originals preserved")
+    }
+
     fn refine_chunks(&mut self, paths: &Paths, settings: &Settings, text: &str) -> Result<String> {
         let (left, right) = cleanup_split(text)
             .context("Cleanup cannot fit even the smallest input; original preserved")?;

@@ -2,6 +2,7 @@ pub mod audio;
 pub mod config;
 pub mod content;
 pub mod context;
+pub mod daily;
 pub mod device;
 pub mod explore;
 pub mod history;
@@ -10,6 +11,7 @@ pub mod logging;
 mod mlx;
 pub mod models;
 mod queue;
+pub mod speakers;
 
 use anyhow::{bail, Result};
 pub use config::{Paths, Settings};
@@ -65,10 +67,12 @@ pub struct Service {
     settings: Mutex<Settings>,
     engine: Arc<Mutex<LocalSpeechEngine>>,
     cleanup_engine: Arc<Mutex<inference::LocalCleanupEngine>>,
+    speaker_engine: Arc<Mutex<speakers::Engine>>,
     pub events: broadcast::Sender<Event>,
     session: tokio::sync::Mutex<Option<Session>>,
     processing: std::sync::atomic::AtomicBool,
     recording: std::sync::atomic::AtomicBool,
+    daily_worker_started: std::sync::atomic::AtomicBool,
 }
 impl Service {
     pub fn new() -> Result<Arc<Self>> {
@@ -77,16 +81,19 @@ impl Service {
         settings.validate()?;
         paths.apply_storage(&settings)?;
         history::History::open(&paths)?;
+        speakers::connection(&paths)?;
         let (events, _) = broadcast::channel(256);
         let service = Arc::new(Self {
             engine: Arc::new(Mutex::new(LocalSpeechEngine::new(paths.clone()))),
             cleanup_engine: Arc::new(Mutex::new(inference::LocalCleanupEngine::new())),
+            speaker_engine: Arc::new(Mutex::new(speakers::Engine::default())),
             paths,
             settings: Mutex::new(settings),
             events,
             session: tokio::sync::Mutex::new(None),
             processing: std::sync::atomic::AtomicBool::new(false),
             recording: std::sync::atomic::AtomicBool::new(false),
+            daily_worker_started: std::sync::atomic::AtomicBool::new(false),
         });
         let weak = Arc::downgrade(&service);
         tokio::spawn(async move {
@@ -104,10 +111,93 @@ impl Service {
                         let _ = service.events.send(Event::Unloaded);
                     }
                 };
+                if let Ok(mut engine) = service.speaker_engine.try_lock() {
+                    if engine.unload_if_idle(seconds) {
+                        let _ = service.events.send(Event::Unloaded);
+                    }
+                };
             }
         });
         Ok(service)
     }
+    /// Start once for long-running hosts; short read-only commands do not run jobs.
+    pub fn start_daily_worker(self: &Arc<Self>) {
+        if self
+            .daily_worker_started
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let Some(service) = weak.upgrade() else { break };
+                let settings = service.settings();
+                let mut failed = false;
+                let paths = service.paths.clone();
+                let opts = settings.clone();
+                let sync =
+                    tokio::task::spawn_blocking(move || speakers::sync_names(&paths, &opts)).await;
+                let sync_error = match sync {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error.to_string()),
+                    Err(error) => Some(error.to_string()),
+                };
+                if let Some(error) = sync_error {
+                    failed = true;
+                    let _ = service.events.send(Event::Error {
+                        message: format!("Speaker name sync will retry: {error}"),
+                    });
+                }
+                if settings.daily_structure_enabled {
+                    let result = service.structure_days(None, false).await;
+                    match result {
+                        Ok(paths) => {
+                            for path in paths {
+                                service.activity(format!(
+                                    "Structured daily notes saved: {}",
+                                    path.display()
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            failed = true;
+                            let _ = service.events.send(Event::Error { message: format!("Daily structuring failed; transcription files preserved, retry in one hour: {error:#}") });
+                        }
+                    }
+                }
+                drop(service);
+                // Calendar dates, not elapsed 24-hour windows; handles DST and restarts.
+                tokio::time::sleep(std::time::Duration::from_secs(if failed {
+                    3600
+                } else {
+                    60
+                }))
+                .await;
+            }
+        });
+    }
+
+    pub async fn structure_days(
+        &self,
+        day: Option<chrono::NaiveDate>,
+        force: bool,
+    ) -> Result<Vec<std::path::PathBuf>> {
+        let settings = self.settings();
+        if day.is_some_and(|day| day >= chrono::Local::now().date_naive()) {
+            bail!("Daily structuring only processes completed local dates");
+        }
+        // Download only when a completed date actually needs organization.
+        if !history::History::open(&self.paths)?
+            .completed_days(chrono::Local::now().date_naive())?
+            .is_empty()
+        {
+            models::download(&self.paths, &settings.daily_structure_model, &self.events).await?;
+        }
+        let paths = self.paths.clone();
+        tokio::task::spawn_blocking(move || daily::run(&paths, &settings, day, force)).await?
+    }
+
     pub fn settings(&self) -> Settings {
         self.settings.lock().unwrap().clone()
     }
@@ -122,6 +212,7 @@ impl Service {
             models::speech_path(&self.paths, &settings.speech_model)?;
             models::cleanup_location(&self.paths, &settings)?;
             self.engine.lock().unwrap().unload();
+            self.speaker_engine.lock().unwrap().unload();
             let cleanup_engine = self.cleanup_engine.clone();
             tokio::task::spawn_blocking(move || cleanup_engine.lock().unwrap().unload()).await?;
             *self.settings.lock().unwrap() = settings;
@@ -154,6 +245,7 @@ impl Service {
             tokio::task::spawn_blocking(move || cleanup_engine.lock().unwrap().unload()).await?;
         }
         self.engine.lock().unwrap().unload();
+        self.speaker_engine.lock().unwrap().unload();
         *self.settings.lock().unwrap() = settings;
         Ok(())
     }
@@ -179,6 +271,8 @@ impl Service {
             created_at: chrono::Utc::now().to_rfc3339(),
             raw: text.into(),
             refined: text.into(),
+            speaker_turns: Vec::new(),
+            speaker_error: None,
             speech_model: "manual-note".into(),
             microphone: None,
             filter_model: None,
@@ -208,6 +302,7 @@ impl Service {
         tokio::task::spawn_blocking(move || engine.lock().unwrap().unload()).await?;
         let cleanup_engine = self.cleanup_engine.clone();
         tokio::task::spawn_blocking(move || cleanup_engine.lock().unwrap().unload()).await?;
+        self.speaker_engine.lock().unwrap().unload();
         let _ = self.events.send(Event::Unloaded);
         Ok(())
     }
@@ -238,6 +333,108 @@ impl Service {
         })
         .await?
     }
+    async fn detect_speakers(
+        &self,
+        samples: Vec<f32>,
+        settings: Settings,
+        raw: &str,
+        refined: &str,
+    ) -> Result<Vec<speakers::SpeakerTurn>> {
+        let engine = self.speaker_engine.clone();
+        let paths = self.paths.clone();
+        let opts = settings.clone();
+        let (detection, samples) = tokio::task::spawn_blocking(move || {
+            let detection = engine.lock().unwrap().detect(&paths, &opts, &samples)?;
+            anyhow::Ok((detection, samples))
+        })
+        .await??;
+        let mut identities = std::collections::HashMap::new();
+        for voice in detection.voices {
+            let mut clip = Vec::new();
+            for range in voice.ranges {
+                let start = (range[0].max(0.0) * 16000.0) as usize;
+                let end = ((range[1].max(0.0) * 16000.0) as usize).min(samples.len());
+                if start < end {
+                    clip.extend_from_slice(&samples[start..end]);
+                }
+                if clip.len() >= 240000 {
+                    break;
+                }
+            }
+            let profile = speakers::identify(&self.paths, &voice.embedding, &clip, &settings)?;
+            identities.insert(voice.local_speaker, profile);
+        }
+        let locals: std::collections::HashSet<_> = detection
+            .turns
+            .iter()
+            .map(|turn| turn.local_speaker)
+            .collect();
+        if locals.len() == 1 {
+            let speaker = identities
+                .get(locals.iter().next().unwrap())
+                .and_then(|profile| profile.as_ref());
+            return Ok(vec![speakers::SpeakerTurn {
+                speaker_id: speaker.map(|speaker| speaker.id.clone()),
+                speaker_name: speaker
+                    .map(|speaker| speaker.name.clone())
+                    .unwrap_or_else(|| "Unknown speaker".into()),
+                start_seconds: detection.turns.first().unwrap().start,
+                end_seconds: detection.turns.last().unwrap().end,
+                raw: raw.into(),
+                refined: refined.into(),
+                overlap: false,
+            }]);
+        }
+        let mut turns = Vec::new();
+        for turn in &detection.turns {
+            let start = ((turn.start * 16000.0) as usize).min(samples.len());
+            let end = ((turn.end * 16000.0) as usize).min(samples.len());
+            if end <= start {
+                continue;
+            }
+            let engine = self.engine.clone();
+            let clip = samples[start..end].to_vec();
+            let opts = settings.clone();
+            let text = tokio::task::spawn_blocking(move || {
+                engine.lock().unwrap().transcribe(&clip, &opts)
+            })
+            .await??;
+            if text.trim().is_empty() {
+                continue;
+            }
+            let saved = self
+                .refine(&text, settings.clone())
+                .await
+                .ok()
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or_else(|| text.clone());
+            let overlap = detection.turns.iter().any(|other| {
+                other.local_speaker != turn.local_speaker
+                    && other.start < turn.end
+                    && other.end > turn.start
+            });
+            let speaker = if overlap {
+                None
+            } else {
+                identities
+                    .get(&turn.local_speaker)
+                    .and_then(|profile| profile.as_ref())
+            };
+            turns.push(speakers::SpeakerTurn {
+                speaker_id: speaker.map(|speaker| speaker.id.clone()),
+                speaker_name: speaker
+                    .map(|speaker| speaker.name.clone())
+                    .unwrap_or_else(|| "Unknown speaker".into()),
+                start_seconds: turn.start,
+                end_seconds: turn.end,
+                raw: text,
+                refined: saved,
+                overlap,
+            });
+        }
+        Ok(turns)
+    }
+
     async fn process_at(
         &self,
         samples: Vec<f32>,
@@ -329,6 +526,24 @@ impl Service {
             ));
             return Ok(None);
         }
+        let (speaker_turns, speaker_error) = if settings.speaker_detection_enabled {
+            self.activity(format!("Segment {id}: detecting speakers locally"));
+            match self
+                .detect_speakers(samples.clone(), settings.clone(), &raw, &refined)
+                .await
+            {
+                Ok(turns) => (turns, None),
+                Err(error) => {
+                    let message = format!("Speaker detection failed; complete transcript saved without attribution: {error:#}");
+                    let _ = self.events.send(Event::Error {
+                        message: message.clone(),
+                    });
+                    (Vec::new(), Some(message))
+                }
+            }
+        } else {
+            (Vec::new(), None)
+        };
         // Queued recording jobs remain recoverable until this entire operation succeeds.
         // Save original and cleaned text together after the model decides what remains.
         let audio_path = if settings.retain_audio {
@@ -338,11 +553,13 @@ impl Service {
         } else {
             None
         };
-        let entry = Transcript {
+        let mut entry = Transcript {
             id,
             created_at: created_at.to_rfc3339(),
             refined,
             raw,
+            speaker_turns,
+            speaker_error,
             speech_model: settings.speech_model.clone(),
             microphone: settings.microphone.clone(),
             filter_model: settings
@@ -353,6 +570,7 @@ impl Service {
             filter_error,
         };
         history::History::open(&self.paths)?.insert(&entry)?;
+        speakers::resolve_names(&speakers::connection(&self.paths)?, &mut entry)?;
         self.log_processed(&entry);
         let _ = self.events.send(Event::Transcript {
             entry: entry.clone(),
@@ -388,6 +606,7 @@ impl Service {
         let _ = self.events.send(Event::Activity { log });
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
+        self.start_daily_worker();
         let mut session = self.session.lock().await;
         if session.is_some() {
             bail!("Already listening");

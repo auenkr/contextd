@@ -89,7 +89,11 @@ impl Browser {
         self.files = explore::list(&self.paths, self.folder)?;
         let index = selected
             .as_ref()
-            .and_then(|file| self.files.iter().position(|new| new.path == file.path))
+            .and_then(|file| {
+                self.files.iter().position(|new| {
+                    new.path == file.path || self.folder == Folder::Notes && new.name == file.name
+                })
+            })
             .or_else(|| (!self.files.is_empty()).then_some(0));
         let changed = index
             .and_then(|i| self.files.get(i))
@@ -97,8 +101,12 @@ impl Browser {
             != selected.as_ref().map(|f| (&f.path, f.modified, f.bytes));
         self.selection.select(index);
         if changed || self.files.is_empty() {
-            let same_file = index.and_then(|i| self.files.get(i)).map(|f| &f.path)
-                == selected.as_ref().map(|f| &f.path);
+            let same_file = index
+                .and_then(|i| self.files.get(i))
+                .zip(selected.as_ref())
+                .is_some_and(|(new, old)| {
+                    new.path == old.path || self.folder == Folder::Notes && new.name == old.name
+                });
             let previous_scroll = self.scroll;
             let note = self.selected_note;
             self.load_preview();
@@ -201,8 +209,11 @@ impl Browser {
                         if close {
                             self.editor = None;
                             let selected = self.selected_note;
-                            self.load_preview();
-                            self.selected_note = selected;
+                            if let Err(error) = self.refresh() {
+                                self.message =
+                                    format!("Saved, but preview refresh failed: {error:#}");
+                            }
+                            self.selected_note = selected.min(self.entries.len().saturating_sub(1));
                         } else {
                             self.editor.as_mut().unwrap().original = text;
                         }
@@ -244,6 +255,63 @@ impl Browser {
     }
     fn preview_lines(&mut self, width: u16) -> Vec<Line<'static>> {
         self.note_offsets.clear();
+        let structured = self
+            .selection
+            .selected()
+            .and_then(|i| self.files.get(i))
+            .is_some_and(|file| {
+                file.path.parent() == Some(self.paths.root.join("structured").as_path())
+            });
+        if structured {
+            let mut lines = Vec::new();
+            let mut offset: usize = 0;
+            for text in self.preview.lines() {
+                if let Some(id) = text
+                    .strip_prefix("<!-- memory-id: ")
+                    .and_then(|s| s.split(';').next())
+                {
+                    if self
+                        .entries
+                        .get(self.note_offsets.len())
+                        .is_some_and(|entry| entry.id == id)
+                    {
+                        self.note_offsets.push(offset.saturating_sub(2));
+                    }
+                    continue;
+                }
+                let line = if let Some(title) = text.strip_prefix("### ") {
+                    Line::styled(
+                        title.to_owned(),
+                        Style::default()
+                            .fg(tui::ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else if let Some(title) = text.strip_prefix("## ") {
+                    Line::styled(
+                        title.to_owned(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else if let Some(title) = text.strip_prefix("# ") {
+                    Line::styled(
+                        title.to_owned(),
+                        Style::default()
+                            .fg(tui::ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Line::from(text.to_owned())
+                };
+                offset += Paragraph::new(line.clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(width);
+                lines.push(line);
+            }
+            // Only timestamps belonging to indexed notes participate in editing.
+            self.note_offsets.truncate(self.entries.len());
+            return lines;
+        }
         if self.entries.is_empty() {
             return self
                 .preview
@@ -305,6 +373,24 @@ impl Browser {
                     .lines()
                     .map(|line| Line::from(line.to_owned())),
             );
+            for turn in &entry.speaker_turns {
+                note.push(Line::styled(
+                    format!(
+                        "{} · +{:.1}s{}",
+                        turn.speaker_name,
+                        turn.start_seconds,
+                        if turn.overlap {
+                            " · overlapping speech"
+                        } else {
+                            ""
+                        }
+                    ),
+                    Style::default().fg(tui::ACCENT),
+                ));
+                if entry.speaker_turns.len() > 1 {
+                    note.extend(turn.refined.lines().map(|line| Line::from(line.to_owned())));
+                }
+            }
             if let Some(source) = &entry.microphone {
                 note.push(Line::styled(
                     format!("Source · {source}"),

@@ -50,6 +50,8 @@ pub struct ProcessingLog {
     pub audio_path: Option<String>,
     pub history_path: String,
     pub filter_error: Option<String>,
+    pub speakers: Vec<String>,
+    pub speaker_error: Option<String>,
 }
 
 impl ProcessingLog {
@@ -80,6 +82,14 @@ impl ProcessingLog {
                 .to_string_lossy()
                 .into_owned(),
             filter_error: entry.filter_error.clone(),
+            speakers: entry
+                .speaker_turns
+                .iter()
+                .map(|turn| turn.speaker_name.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            speaker_error: entry.speaker_error.clone(),
         })
     }
 

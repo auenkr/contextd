@@ -294,3 +294,18 @@ S1-mini is a transcript normalizer, not a general relevance classifier. If it re
 Set the policy to `skip_all` to discard **every** transcript containing one to three words, including useful short statements. Set it to `keep` to preserve even empty cleaned output alongside the original transcript. Older `skip_filler` settings are accepted as an alias for `cleanup`; they no longer enable a phrase list. The rule applies to microphone speech and imported recordings; manually added notes are always kept.
 
 Discarded segments produce no completion summary, searchable entry, or transcript text in logs. Verbose diagnostics record only the segment ID and discard reason. Temporary pending audio is removed when the recording worker finishes the discarded job. Existing saved notes are not removed. Cleanup failures preserve the original text and report the error.
+
+## Daily structuring and transcription retention
+
+| Setting | Default | Behavior |
+|---|---|---|
+| `daily_structure_enabled` | `true` | Organize completed local dates automatically in the dashboard/server; catch up on restart. |
+| `daily_structure_model` | `qwen2.5-1.5b-instruct` | Separate catalog GGUF instruction model, downloaded when first needed. S1-mini, custom models, and MLX are unsupported. |
+| `daily_group_gap_minutes` | `30` | Start a separate session after this many minutes between notes; `0` lets the model decide (maximum: 1440). |
+| `transcription_retention_days` | `7` | Delete original daily transcription Markdown after this many calendar days, only after successful structuring; `0` keeps it indefinitely. |
+
+Final output: `structured/YYYY-MM-DD.md`. The searchable index, logs, and audio are retained. Manual `contextd structure` also applies retention. See [Daily structured notes](DAILY_STRUCTURING.md).
+
+## Speaker detection
+
+Speaker detection defaults to enabled. Configure `speaker_detection_enabled`, `speaker_match_threshold` (0.9), `speaker_match_margin` (0.04), and optional `speaker_python`. New voice samples are retained separately from full recordings. See [speaker settings and processing](SPEAKERS.md).

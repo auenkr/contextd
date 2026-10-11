@@ -222,6 +222,13 @@ pub fn run(
                 }
                 Ok(ServiceEvent::Error { message }) => log(&mut logs, Color::Red, message),
                 Ok(ServiceEvent::Processed { log: entry }) => {
+                    if !entry.speakers.is_empty() {
+                        log(
+                            &mut logs,
+                            Color::Cyan,
+                            format!("Speakers: {}", entry.speakers.join(", ")),
+                        );
+                    }
                     log(
                         &mut logs,
                         Color::Gray,
@@ -319,6 +326,7 @@ pub fn run(
                 },
                 "Config",
                 "Explore notes",
+                "Speakers",
                 "Setup",
                 "Quit",
             ]
@@ -593,10 +601,17 @@ pub fn run(
                     if let Err(error) = result {
                         log(&mut logs, Color::Red, error.to_string());
                     }
-                } else if selected == 4 || selected == 3 {
+                } else if selected == 3 {
+                    ratatui::restore();
+                    let result = crate::speakers::run(service.paths.clone());
+                    terminal = ratatui::try_init()?;
+                    if let Err(error) = result {
+                        log(&mut logs, Color::Red, error.to_string());
+                    }
+                } else if selected == 4 || selected == 5 {
                     let service = service.clone();
                     pending = Some(Pending {
-                        job: if selected == 4 { Job::Exit } else { Job::Setup },
+                        job: if selected == 5 { Job::Exit } else { Job::Setup },
                         task: stop_task(&service, &runtime),
                     });
                 } else if selected == 1 || recording {

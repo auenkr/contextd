@@ -33,6 +33,7 @@ The command is **contextd**; the GitHub repository is **contextd**. This is an e
 - [Install, build, update, and troubleshoot](docs/INSTALLATION.md)
 - [Configuration and storage](docs/CONFIGURATION.md)
 - [CLI user flows](docs/CLI_USER_FLOWS.md)
+- [Daily structured output and 7-day transcription retention](docs/DAILY_STRUCTURING.md)
 - [Cleanup model research and historical evaluation](docs/CLEANUP_MODEL_RESEARCH.md)
 - [Contributing and core crate structure](CONTRIBUTING.md)
 
@@ -271,6 +272,12 @@ The `idle_unload_seconds` setting controls both engines:
 - **0**: keep loaded.
 - `contextd unload`: release them immediately; they reload for the next utterance.
 
+## Final daily output
+
+After each local day ends, a background job groups related notes into `structured/YYYY-MM-DD.md`, preserving all saved text, original transcripts, and timestamps. It catches up after restarts and the notes browser shows this structured file as the final daily view. A separate local instruction model (default: Qwen 2.5 1.5B) downloads when first needed.
+
+Original `notes/YYYY-MM-DD.md` transcription files are deleted after **7 days**, only after successful structuring. Configure `transcription_retention_days` to change this period; **0** keeps them indefinitely. Structured files and the searchable index remain. Use `contextd structure` for a manual catch-up. See [daily structuring](docs/DAILY_STRUCTURING.md) for settings and failure behavior.
+
 ## Recording behavior
 
 - Multiple selected microphones, independent mono 16 kHz resampling, Silero speech-aware segmentation.
@@ -311,6 +318,7 @@ crates/core/                    Shared recording + model + note pipeline
   src/models.rs                 Downloadable catalog and default selections
   src/queue.rs                  Disk-backed speech backlog
   src/history.rs                SQLite index + atomic daily Markdown generation
+  src/daily.rs                  Daily topic grouping, final output, transcription retention
   src/context.rs                Loopback retrieval API
 crates/cli/                     CLI adapter
 ```
@@ -357,3 +365,7 @@ Application source is licensed under [MIT](LICENSE). Dependencies and downloaded
 - ["S1-mini" by "Superwhisper"](https://huggingface.co/superwhisper/s1-mini): the specialized default cleanup model. Model attribution and license links are in [research notes](docs/CLEANUP_MODEL_RESEARCH.md).
 
 The desktop GUI is intentionally not included in the current workspace. A future GUI can depend on `contextd-core` as a crate, just as the CLI does.
+
+## Remembered speakers
+
+Local speaker detection saves a short sample for each new clear voice. Open **Speakers** or run `contextd speakers` to listen and name it. Names synchronize with past notes and are reused for future matching recordings. Samples remain available even when full audio retention is off. See [speaker processing and settings](docs/SPEAKERS.md) for the technical comparison and commands.
