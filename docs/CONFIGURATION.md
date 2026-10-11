@@ -8,7 +8,7 @@ Model downloads report their progress in four places: the bottom gauge with perc
 
 Downloads run in the background: pick several uncached models from the model screen and two transfer at a time while the rest wait for a free slot. Leaving the model screen with `q` does not stop them, and the dashboard keeps reporting their progress until they finish; the microphone starts once the selected models are cached. `Esc`/`Backspace` cancels the transfer and returns to the dashboard, and quitting the dashboard cancels everything. Cancelling removes the partial file, keeps the saved selection, and leaves `Resume recording` ready to retry.
 
-Press `d` in the model screen to delete a cached model and reclaim disk space. The model currently in use is protected, so select a different one first; other cached models are removed together with any partial download.
+Press `d` in the model screen to delete a cached model and reclaim disk space. Models used by speech recognition, enabled cleanup, or enabled daily processing are protected. The list marks daily-processing models, and deletion names the setting that uses them. Change that model or disable its feature in All settings first; other cached models are removed together with any partial download.
 
 During setup, `h`/`l` or the left/right arrows choose the speech model, `f` cycles cleanup models, `c` toggles cleanup, `a` toggles audio retention, `m` cycles microphones, and `v` cycles language presets. Choose **Setup** later to revisit these options. Config pauses capture and finishes queued work before editing; returning resumes recording. Explore notes keeps capture running.
 

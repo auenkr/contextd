@@ -261,8 +261,9 @@ async fn main() -> Result<()> {
                 Command::RemoveModel { id } => {
                     let settings = service.settings();
                     let id = models::canonical_cleanup_id(&id);
-                    if id == settings.speech_model || id == models::canonical_cleanup_id(&settings.filter_model) || id == settings.daily_structure_model {
-                        anyhow::bail!("Select another model before deleting the selected cache");
+                    let users = models::cache_users(&settings, id);
+                    if !users.is_empty() {
+                        anyhow::bail!("Model is used by {}. Change that model or disable its feature in Config → All settings before deleting it", users.join(", "));
                     }
                     models::delete(&service.paths, id)?;
                     eprintln!("Removed cached model: {id}");
