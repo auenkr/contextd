@@ -422,6 +422,27 @@ fn model_file(paths: &Paths, id: &str) -> Result<std::path::PathBuf> {
     }
 }
 
+/// Features that require this catalog model's cache to remain available.
+pub fn cache_users(settings: &crate::Settings, id: &str) -> Vec<&'static str> {
+    let id = canonical_cleanup_id(id);
+    let mut users = Vec::new();
+    if id == settings.speech_model {
+        users.push("speech_model");
+    }
+    if settings.filter_enabled
+        && settings.cleanup_source.is_none()
+        && id == canonical_cleanup_id(&settings.filter_model)
+    {
+        users.push("filter_model");
+    }
+    if settings.daily_structure_enabled
+        && id == canonical_cleanup_id(&settings.daily_structure_model)
+    {
+        users.push("daily_structure_model");
+    }
+    users
+}
+
 /// Remove a cached model so a later selection can download it again.
 pub fn delete(paths: &Paths, id: &str) -> Result<()> {
     let id = canonical_cleanup_id(id);
@@ -646,5 +667,35 @@ mod tests {
         );
         assert!(cleanup_path(&paths, "../../outside.gguf").is_err());
         assert!(cleanup_path(&paths, "whisper-base").is_err());
+    }
+}
+
+#[cfg(test)]
+mod cache_usage_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_features_do_not_protect_their_cache() {
+        let mut settings = crate::Settings::default();
+        settings.filter_model = "qwen3.5:0.8b".into();
+        settings.daily_structure_model = "qwen2.5-1.5b-instruct".into();
+        settings.filter_enabled = true;
+        settings.daily_structure_enabled = true;
+        assert_eq!(
+            cache_users(&settings, "qwen2.5-1.5b-instruct"),
+            vec!["daily_structure_model"]
+        );
+        assert_eq!(
+            cache_users(&settings, canonical_cleanup_id(&settings.filter_model)),
+            vec!["filter_model"]
+        );
+        settings.daily_structure_enabled = false;
+        settings.filter_enabled = false;
+        assert!(cache_users(&settings, "qwen2.5-1.5b-instruct").is_empty());
+        assert!(cache_users(&settings, &settings.filter_model).is_empty());
+        assert_eq!(
+            cache_users(&settings, &settings.speech_model),
+            vec!["speech_model"]
+        );
     }
 }

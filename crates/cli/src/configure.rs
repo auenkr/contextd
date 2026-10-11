@@ -582,7 +582,10 @@ pub fn run(
             if tab < 2 {
             let items: Vec<_> = catalog.iter().map(|model| {
                 let active = model.id == settings.speech_model || model.kind == "filter" && model.id == models::canonical_cleanup_id(&settings.filter_model);
-                let state = if active {
+                let daily_active = settings.daily_structure_enabled && model.id == models::canonical_cleanup_id(&settings.daily_structure_model);
+                let state = if daily_active {
+                    if active { "selected + daily processing" } else { "daily processing" }
+                } else if active {
                     "selected"
                 } else if downloads.queued(&model.id) {
                     "queued"
@@ -983,18 +986,11 @@ pub fn run(
             }
             KeyCode::Char('d') if tab < 2 => {
                 let model = catalog[selected].clone();
-                // Only the model that is actively selected is protected, so any
-                // other cached model can be removed to free disk space.
-                let selected_model = if tab == 0 {
-                    model.id == settings.speech_model
-                } else {
-                    model.id == models::canonical_cleanup_id(&settings.filter_model)
-                        || model.id == settings.daily_structure_model
-                };
-                if selected_model {
+                let users = models::cache_users(&settings, &model.id);
+                if !users.is_empty() {
                     message = format!(
-                        "{} is selected. Pick another model before deleting it.",
-                        model.name
+                        "{} is used by {}. Change that model or disable its feature in All settings before deleting it.",
+                        model.name, users.join(", ")
                     );
                 } else if !model.installed {
                     message = format!("{} is not cached.", model.name);
