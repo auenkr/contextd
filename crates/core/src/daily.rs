@@ -89,6 +89,18 @@ fn excerpt(text: &str) -> String {
     )
 }
 
+fn note_title(entry: &Transcript) -> String {
+    entry
+        .refined
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("Individual note")
+        .trim()
+        .chars()
+        .take(100)
+        .collect()
+}
+
 fn group_entries(
     entries: &[Transcript],
     gap_minutes: u32,
@@ -115,15 +127,7 @@ fn group_entries(
         let plan = if end - start == 1 {
             // An isolated note needs no grouping decision. Use its own first line
             // as the title, avoiding a model inventing indexes from a prior session.
-            let title: String = entries[start]
-                .refined
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or("Individual note")
-                .trim()
-                .chars()
-                .take(100)
-                .collect();
+            let title = note_title(&entries[start]);
             vec![Group {
                 title,
                 entries: vec![0],
@@ -137,13 +141,29 @@ fn group_entries(
                 let input = serde_json::to_string(&serde_json::json!({
                     "previous_topic":groups.last().map(|g| &g.title), "overlap":start < next, "notes":notes
                 }))?;
-                match infer(&input).and_then(|output| parse_plan(&output, end - start)) {
+                let output = infer(&input);
+                let malformed = output.is_ok();
+                match output.and_then(|output| parse_plan(&output, end - start)) {
                     Ok(plan) => break plan,
                     Err(error)
-                        if error.to_string().contains("exceeds model context")
+                        if (malformed || error.to_string().contains("exceeds model context"))
                             && end > next + 1 =>
                     {
                         end = next + (end - next) / 2;
+                    }
+                    Err(_) if malformed => {
+                        // A model label is optional; complete notes are not. At
+                        // minimum batch size, preserve each note independently.
+                        break (start..end)
+                            .map(|index| Group {
+                                title: if index < next {
+                                    groups.last().unwrap().title.clone()
+                                } else {
+                                    note_title(&entries[index])
+                                },
+                                entries: vec![index - start],
+                            })
+                            .collect();
                     }
                     Err(error) => return Err(error),
                 }
@@ -581,6 +601,44 @@ mod tests {
     }
 
     #[test]
+    fn malformed_batch_retries_smaller_without_losing_notes() {
+        let day = Local::now().date_naive() - chrono::Duration::days(1);
+        let entries: Vec<_> = (0..9).map(|i| entry(day, i)).collect();
+        let mut reduced = false;
+        let groups = group_entries(&entries, 30, |input| {
+            let value: serde_json::Value = serde_json::from_str(input)?;
+            if value["notes"].as_array().unwrap().len() > 2 {
+                reduced = true;
+                return Ok(r#"{"topics":["Release discussion"]}"#.into());
+            }
+            one_group(input)
+        })
+        .unwrap();
+        assert!(reduced);
+        assert_eq!(
+            groups
+                .iter()
+                .flat_map(|g| g.entries.iter().copied())
+                .collect::<Vec<_>>(),
+            (0..9).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn consistently_malformed_labels_fall_back_to_complete_individual_notes() {
+        let day = Local::now().date_naive() - chrono::Duration::days(1);
+        let entries: Vec<_> = (0..8).map(|i| entry(day, i)).collect();
+        let groups = group_entries(&entries, 30, |_| Ok("invalid JSON".into())).unwrap();
+        assert_eq!(groups.len(), entries.len());
+        let text = render(day, &entries, &groups).unwrap();
+        for entry in entries {
+            assert!(text.contains(&entry.raw));
+            assert!(text.contains(&entry.refined));
+            assert_eq!(text.matches(&entry.id).count(), 1);
+        }
+    }
+
+    #[test]
     fn catchup_retention_restart_edit_and_failure_are_safe() {
         let directory = tempfile::tempdir().unwrap();
         let paths = Paths::in_directory(directory.path());
@@ -599,8 +657,8 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(settings.transcription_retention_days, 7);
         let old_source = paths.root.join(format!("notes/{old_day}.md"));
-        assert!(run_with(&paths, &settings, Some(old_day), false, |_| Ok(
-            "invalid output".into()
+        assert!(run_with(&paths, &settings, Some(old_day), false, |_| Err(
+            anyhow::anyhow!("inference unavailable")
         ))
         .is_err());
         assert!(old_source.exists());

@@ -131,6 +131,13 @@ impl Capture {
                 while !flag.load(Ordering::Relaxed) {
                     thread::sleep(std::time::Duration::from_millis(50));
                 }
+                // CPAL 0.15 CoreAudio's disconnect listener captures a cloned
+                // stream for explicitly selected devices, retaining the audio
+                // unit after drop. Stop it explicitly so changing inputs releases
+                // Bluetooth call mode even while the process stays alive.
+                if let Err(error) = stream.pause() {
+                    let _ = errors.send(format!("Stopping microphone: {error}"));
+                }
                 drop(stream);
                 Ok(())
             })();
@@ -693,6 +700,66 @@ mod tests {
             );
             println!("Device output transcript: {transcript}");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires connected Bluetooth headphones and microphone access; changes audio mode temporarily"]
+    fn live_switch_from_explicit_bluetooth_restores_stereo_in_same_process() {
+        let bluetooth = std::env::var("CONTEXTD_TEST_BLUETOOTH_MIC").unwrap();
+        let replacement = std::env::var("CONTEXTD_TEST_REPLACEMENT_MIC").unwrap();
+        let inputs = microphones().unwrap();
+        let id = |name: &str| {
+            inputs
+                .iter()
+                .find(|mic| mic.name == name)
+                .unwrap()
+                .id
+                .clone()
+        };
+        let output = || {
+            let result = std::process::Command::new("system_profiler")
+                .args(["SPAudioDataType", "-json"])
+                .output()
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+            value["SPAudioDataType"][0]["_items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| {
+                    item["_name"] == bluetooth && item["coreaudio_device_output"].is_number()
+                })
+                .unwrap()
+                .clone()
+        };
+        let (sender, _receiver) = mpsc::channel(256);
+        let (errors, _error_rx) = mpsc::unbounded_channel();
+        let mut old = Capture::start(Some(id(&bluetooth)), sender.clone(), errors.clone()).unwrap();
+        thread::sleep(std::time::Duration::from_secs(2));
+        assert_eq!(
+            output()["coreaudio_device_output"],
+            1,
+            "fixture must enter call mode"
+        );
+        old.stop();
+        let mut new = Capture::start(Some(id(&replacement)), sender, errors).unwrap();
+        let mut restored = false;
+        for _ in 0..20 {
+            let state = output();
+            if state["coreaudio_device_output"] == 2
+                && state["coreaudio_device_srate"].as_u64().unwrap() >= 44100
+            {
+                restored = true;
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(250));
+        }
+        new.stop();
+        assert!(
+            restored,
+            "Bluetooth output stayed in call mode after switching inputs"
+        );
     }
 
     #[test]

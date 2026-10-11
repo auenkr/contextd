@@ -130,6 +130,7 @@ impl Service {
         }
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
+            let mut startup = true;
             loop {
                 let Some(service) = weak.upgrade() else { break };
                 let settings = service.settings();
@@ -150,9 +151,18 @@ impl Service {
                     });
                 }
                 if settings.daily_structure_enabled {
+                    if startup {
+                        service.activity("Startup sync: checking all completed days for missing or outdated structured notes");
+                    }
                     let result = service.structure_days(None, false).await;
                     match result {
                         Ok(paths) => {
+                            if startup {
+                                service.activity(format!(
+                                    "Startup sync complete: {} daily files updated",
+                                    paths.len()
+                                ));
+                            }
                             for path in paths {
                                 service.activity(format!(
                                     "Structured daily notes saved: {}",
@@ -166,6 +176,7 @@ impl Service {
                         }
                     }
                 }
+                startup = false;
                 drop(service);
                 // Calendar dates, not elapsed 24-hour windows; handles DST and restarts.
                 tokio::time::sleep(std::time::Duration::from_secs(if failed {

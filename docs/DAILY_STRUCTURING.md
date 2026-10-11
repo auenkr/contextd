@@ -8,11 +8,11 @@ This is organization, not an abbreviated summary. A local instruction model labe
 
 ## Automatic processing
 
-With `daily_structure_enabled` on (the default), the recording dashboard and the long-running retrieval server check completed local calendar dates every minute. Processing starts after midnight, rather than 24 hours after app launch. If the app was closed, it catches up on the next dashboard/server launch. Nothing runs while the app is closed or the computer sleeps.
+With `daily_structure_enabled` on (the default), the recording dashboard and the long-running retrieval server check completed local calendar dates every minute. Processing starts after midnight, rather than 24 hours after app launch. On every dashboard/server launch, a background startup sync scans all previous dates and processes every missing or outdated structured file, oldest first. Current files are skipped. Recording continues during catch-up. Nothing runs while the app is closed or the computer sleeps.
 
 Late queued transcriptions, edited notes, deleted notes, and a changed structuring model cause the affected day to rebuild. Unchanged days are skipped across restarts. An edit makes the browser show updated source notes until the final file is rebuilt. The notes browser otherwise shows the structured file as the final view for that date.
 
-Failed processing preserves transcription files and the previous successful output. It reports an error and retries in one hour; a failed date does not prevent other dates from being processed. Files are replaced atomically and a shared lock prevents competing structuring runs.
+Malformed model responses are retried with smaller batches. If the smallest batch still has invalid labels, its notes become individual sections titled from their first lines; complete text is preserved. Failed processing preserves transcription files and the previous successful output. It reports an error and retries in one hour; a failed date does not prevent other dates from being processed. Files are replaced atomically and a shared lock prevents competing structuring runs.
 
 The default structuring model is **Qwen 2.5 1.5B Instruct, Q4_K_M** (about 1.1 GB). It downloads when there is a completed day to process, reuses an existing cache, and runs locally. This model is separate from speech recognition and per-utterance cleanup. S1-mini cannot be used for daily organization. Other catalog GGUF instruction models can be selected; custom models and MLX models are not supported for this job yet.
 
