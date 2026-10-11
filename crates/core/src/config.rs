@@ -97,7 +97,7 @@ impl Default for Settings {
             retain_audio: false,
             record_device_audio: false,
             speaker_detection_enabled: true,
-            speaker_match_threshold: 0.9,
+            speaker_match_threshold: 0.75,
             speaker_match_margin: 0.04,
             speaker_python: None,
             short_transcript_policy: ShortTranscriptPolicy::default(),

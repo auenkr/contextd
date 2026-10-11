@@ -55,6 +55,8 @@ pub fn connection(paths: &Paths) -> Result<Connection> {
         "CREATE TABLE IF NOT EXISTS speakers (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, named INTEGER NOT NULL,
         document TEXT NOT NULL, embedding TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS speaker_aliases (id TEXT PRIMARY KEY, speaker_id TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS speaker_embeddings (id TEXT PRIMARY KEY, speaker_id TEXT NOT NULL, embedding TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS speaker_sync (day TEXT NOT NULL, speaker_id TEXT NOT NULL, old_name TEXT NOT NULL, new_name TEXT NOT NULL, PRIMARY KEY(day,speaker_id));",
     )?;
     Ok(connection)
@@ -69,6 +71,17 @@ pub(crate) fn resolve_names(connection: &Connection, entry: &mut crate::Transcri
     use rusqlite::OptionalExtension;
     for turn in &mut entry.speaker_turns {
         if let Some(id) = &turn.speaker_id {
+            let canonical = connection
+                .query_row(
+                    "SELECT speaker_id FROM speaker_aliases WHERE id=?1",
+                    [id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(canonical) = canonical {
+                turn.speaker_id = Some(canonical);
+            }
+            let id = turn.speaker_id.as_ref().unwrap();
             if let Some(name) = connection
                 .query_row("SELECT name FROM speakers WHERE id=?1", [id], |r| {
                     r.get::<_, String>(0)
@@ -136,6 +149,135 @@ pub fn rename(paths: &Paths, settings: &Settings, id: &str, name: &str) -> Resul
         .context("Speaker name saved; note synchronization will retry on the next app start")
 }
 
+/// Link a duplicate profile, or `unknown:TRANSCRIPT_ID:TURN_INDEX` (zero based),
+/// to a saved identity. Keep every confirmed embedding instead of averaging voices.
+pub fn link(paths: &Paths, settings: &Settings, source: &str, target: &str) -> Result<()> {
+    crate::history::History::open(paths)?;
+    let target = uuid::Uuid::parse_str(target)?.to_string();
+    let mut connection = connection(paths)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let name: String = tx
+        .query_row("SELECT name FROM speakers WHERE id=?1", [&target], |r| {
+            r.get(0)
+        })
+        .context("Target speaker not found")?;
+    let unknown = source
+        .strip_prefix("unknown:")
+        .map(|value| -> Result<(String, usize)> {
+            let (id, index) = value
+                .rsplit_once(':')
+                .context("Use unknown:TRANSCRIPT_ID:TURN_INDEX")?;
+            Ok((uuid::Uuid::parse_str(id)?.to_string(), index.parse()?))
+        })
+        .transpose()?;
+    let old = if unknown.is_some() {
+        "Unknown speaker".to_string()
+    } else {
+        let source = uuid::Uuid::parse_str(source)?.to_string();
+        if source == target {
+            bail!("Choose a different speaker to link to");
+        }
+        let old: String = tx
+            .query_row("SELECT name FROM speakers WHERE id=?1", [&source], |r| {
+                r.get(0)
+            })
+            .context("Source speaker not found")?;
+        tx.execute(
+            "INSERT INTO speaker_embeddings SELECT id,?2,embedding FROM speakers WHERE id=?1",
+            params![source, target],
+        )?;
+        tx.execute(
+            "UPDATE speaker_embeddings SET speaker_id=?2 WHERE speaker_id=?1",
+            params![source, target],
+        )?;
+        tx.execute(
+            "UPDATE speaker_aliases SET speaker_id=?2 WHERE speaker_id=?1",
+            params![source, target],
+        )?;
+        tx.execute(
+            "INSERT INTO speaker_aliases VALUES (?1,?2)",
+            params![source, target],
+        )?;
+        tx.execute("DELETE FROM speakers WHERE id=?1", [&source])?;
+        old
+    };
+    let documents: Vec<String> = {
+        let mut statement = tx.prepare("SELECT document FROM transcripts")?;
+        let rows = statement.query_map([], |r| r.get(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    let mut changed = false;
+    for document in documents {
+        let mut entry: crate::Transcript = serde_json::from_str(&document)?;
+        if let Some((id, index)) = &unknown {
+            if &entry.id != id {
+                continue;
+            }
+            let turn = entry
+                .speaker_turns
+                .get_mut(*index)
+                .context("Speaker turn not found")?;
+            if turn.speaker_id.is_some() {
+                bail!("This turn already has a speaker; link its profile instead");
+            }
+            turn.speaker_id = Some(target.clone());
+        } else if !entry
+            .speaker_turns
+            .iter()
+            .any(|t| t.speaker_id.as_deref() == Some(source))
+        {
+            continue;
+        }
+        resolve_names(&tx, &mut entry)?;
+        tx.execute(
+            "UPDATE transcripts SET document=?2 WHERE id=?1",
+            params![entry.id, serde_json::to_string(&entry)?],
+        )?;
+        tx.execute(
+            "UPDATE memory_fts SET text=?2 WHERE id=?1",
+            params![entry.id, crate::history::search_text(&entry)],
+        )?;
+        let day = chrono::DateTime::parse_from_rfc3339(&entry.created_at)?
+            .with_timezone(&chrono::Local)
+            .date_naive()
+            .to_string();
+        // Unknown is a per-turn correction: never replace every unknown in a title.
+        let title_old = if unknown.is_some() { &name } else { &old };
+        tx.execute("INSERT INTO speaker_sync VALUES (?1,?2,?3,?4) ON CONFLICT(day,speaker_id) DO UPDATE SET new_name=excluded.new_name", params![day,source,title_old,name])?;
+        changed = true;
+    }
+    if unknown.is_some() && !changed {
+        bail!("Transcript not found");
+    }
+    tx.commit()?;
+    sync_names(paths, settings)
+        .context("Link saved; note synchronization will retry on next app start")
+}
+
+/// Unknown turns can be selected and linked independently in the speaker browser.
+pub fn unknown_turns(paths: &Paths) -> Result<Vec<Speaker>> {
+    let history = crate::history::History::open(paths)?;
+    let mut result = Vec::new();
+    for entry in history.list(10000)? {
+        for (index, turn) in entry.speaker_turns.iter().enumerate() {
+            if turn.speaker_id.is_none() {
+                result.push(Speaker {
+                    id: format!("unknown:{}:{}", entry.id, index),
+                    name: format!(
+                        "Unknown · {} · {:.1}s",
+                        entry.created_at, turn.start_seconds
+                    ),
+                    named: false,
+                    sample_path: String::new(),
+                    created_at: entry.created_at.clone(),
+                    sample_seconds: turn.end_seconds - turn.start_seconds,
+                });
+            }
+        }
+    }
+    Ok(result)
+}
+
 /// Persisted outbox repairs interrupted name changes, including when daily jobs are off.
 pub fn sync_names(paths: &Paths, settings: &Settings) -> Result<()> {
     let connection = connection(paths)?;
@@ -187,9 +329,11 @@ pub fn identify(
     let embedding = normalized(embedding)?;
     let mut connection = connection(paths)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<(f32, Speaker)> = Vec::new();
     {
-        let mut statement = tx.prepare("SELECT document, embedding FROM speakers")?;
+        let mut statement = tx.prepare("SELECT s.document, e.embedding FROM speakers s JOIN (
+            SELECT id AS speaker_id, embedding FROM speakers UNION ALL SELECT speaker_id, embedding FROM speaker_embeddings
+        ) e ON s.id=e.speaker_id")?;
         for row in statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })? {
@@ -200,7 +344,15 @@ pub fn identify(
             }
             let vector = normalized(&vector)?;
             let score: f32 = vector.iter().zip(&embedding).map(|(a, b)| a * b).sum();
-            candidates.push((score, serde_json::from_str::<Speaker>(&document)?));
+            let speaker = serde_json::from_str::<Speaker>(&document)?;
+            if let Some((best, _)) = candidates
+                .iter_mut()
+                .find(|(_, existing)| existing.id == speaker.id)
+            {
+                *best = best.max(score);
+            } else {
+                candidates.push((score, speaker));
+            }
         }
     }
     candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -433,6 +585,87 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linking_preserves_voice_variants_and_corrects_only_selected_unknown() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths::in_directory(directory.path());
+        paths.ensure_dirs().unwrap();
+        let settings = Settings {
+            speaker_match_threshold: 0.9,
+            ..Settings::default()
+        };
+        let clip = vec![0.1; 32000];
+        let first = identify(&paths, &[1.0, 0.0], &clip, &settings)
+            .unwrap()
+            .unwrap();
+        let second = identify(&paths, &[0.0, 1.0], &clip, &settings)
+            .unwrap()
+            .unwrap();
+        let history = crate::history::History::open(&paths).unwrap();
+        let entry = crate::Transcript {
+            id: uuid::Uuid::new_v4().to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            raw: "Hello".into(),
+            refined: "Hello".into(),
+            speech_model: "test".into(),
+            filter_model: None,
+            duration_seconds: 3.0,
+            audio_path: None,
+            filter_error: None,
+            microphone: None,
+            speaker_error: None,
+            speaker_turns: vec![Some(second.id.clone()), None, None]
+                .into_iter()
+                .map(|id| SpeakerTurn {
+                    speaker_id: id,
+                    speaker_name: "Unknown speaker".into(),
+                    start_seconds: 0.0,
+                    end_seconds: 1.0,
+                    raw: "Hello".into(),
+                    refined: "Hello".into(),
+                    overlap: false,
+                })
+                .collect(),
+        };
+        history.insert(&entry).unwrap();
+        link(&paths, &settings, &second.id, &first.id).unwrap();
+        assert_eq!(list(&paths).unwrap().len(), 1);
+        assert_eq!(
+            identify(&paths, &[0.0, 1.0], &clip, &settings)
+                .unwrap()
+                .unwrap()
+                .id,
+            first.id
+        );
+        link(
+            &paths,
+            &settings,
+            &format!("unknown:{}:1", entry.id),
+            &first.id,
+        )
+        .unwrap();
+        let updated = history.list(1).unwrap().remove(0);
+        assert_eq!(
+            updated.speaker_turns[0].speaker_id.as_ref(),
+            Some(&first.id)
+        );
+        assert_eq!(
+            updated.speaker_turns[1].speaker_id.as_ref(),
+            Some(&first.id)
+        );
+        assert!(updated.speaker_turns[2].speaker_id.is_none());
+        assert!(link(&paths, &settings, &first.id, &first.id).is_err());
+        // An in-flight recording using the old identity resolves to its canonical speaker.
+        let mut stale = entry.clone();
+        resolve_names(&connection(&paths).unwrap(), &mut stale).unwrap();
+        assert_eq!(stale.speaker_turns[0].speaker_id.as_ref(), Some(&first.id));
+        rename(&paths, &settings, &first.id, "Golden").unwrap();
+        assert_eq!(
+            history.list(1).unwrap()[0].speaker_turns[1].speaker_name,
+            "Golden"
+        );
+    }
 
     #[test]
     fn known_new_ambiguous_short_and_invalid_voices_are_distinguished() {

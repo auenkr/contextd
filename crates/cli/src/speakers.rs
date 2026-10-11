@@ -37,16 +37,24 @@ pub fn run(paths: Paths) -> Result<()> {
     let _restore = Restore;
     let mut selection = ListState::default().with_selected(Some(0));
     let mut editing: Option<String> = None;
+    let mut linking: Option<usize> = None;
     let mut message = String::new();
     let mut playback: Option<Playback> = None;
     loop {
-        let profiles = speakers::list(&paths)?;
+        let mut profiles = speakers::list(&paths)?;
+        profiles.extend(speakers::unknown_turns(&paths)?);
         let selected = selection
             .selected()
             .unwrap_or(0)
             .min(profiles.len().saturating_sub(1));
         selection.select(Some(selected));
         let profile = profiles.get(selected);
+        let targets: Vec<_> = profiles
+            .iter()
+            .filter(|p| {
+                !p.id.starts_with("unknown:") && profile.is_none_or(|source| source.id != p.id)
+            })
+            .collect();
         terminal.draw(|frame| {
             let rows = Layout::vertical([Constraint::Length(3),Constraint::Min(6),Constraint::Length(3),Constraint::Length(2)]).split(frame.area());
             frame.render_widget(Paragraph::new("◆ contextd / Speakers").style(Style::default().fg(tui::ACCENT).add_modifier(Modifier::BOLD)),rows[0]);
@@ -57,13 +65,20 @@ pub fn run(paths: Paths) -> Result<()> {
             ])).collect();
             frame.render_stateful_widget(List::new(items).block(tui::panel(" Saved voices "))
                 .highlight_style(Style::default().bg(tui::SELECTED).fg(tui::ACCENT)).highlight_symbol("› "),columns[0],&mut selection);
-            let detail = profile.map(|speaker| format!("{}\n\n{}\n\nSample: {:.1} seconds\n{}\n\nEnter: listen to this voice\nn: set or change the name\n\nNaming updates earlier notes and future voice matches. Voice samples are kept separately from full recordings.",speaker.name,
+            let detail = profile.map(|speaker| format!("{}\n\n{}\n\nSample: {:.1} seconds\n{}\n\nEnter: listen to this voice\nn: set or change the name\nl: link to an existing speaker\n\nNaming updates earlier notes and future voice matches. Voice samples are kept separately from full recordings.",speaker.name,
                 if speaker.named { "This voice is named." } else { "Listen, then enter the person's name." }, speaker.sample_seconds,speaker.sample_path))
                 .unwrap_or_else(|| "No speakers yet.\n\nEnable Speaker detection in Config and record speech. A new clear voice gets a short saved sample; very brief or overlapping speech stays unknown.".into());
             frame.render_widget(Paragraph::new(detail).wrap(Wrap { trim:false }).block(tui::panel(" Identify the speaker ")),columns[1]);
             let playing = playback.as_ref().is_some_and(|p| !p.sink.empty());
             frame.render_widget(Paragraph::new(format!("{}{}",if playing { "Playing sample · " } else { "" },message)),rows[2]);
-            frame.render_widget(Paragraph::new("↑/↓ j/k: select · Enter: listen · Space: pause/resume · s: stop · n: name · q/Esc: back").style(Style::default().fg(tui::MUTED)),rows[3]);
+            frame.render_widget(Paragraph::new("↑/↓ j/k: select · Enter: listen · Space: pause/resume · s: stop · n: name · l: link · q/Esc: back").style(Style::default().fg(tui::MUTED)),rows[3]);
+            if let Some(index) = linking {
+                let area = tui::centered(frame.area(), (70, 18));
+                frame.render_widget(Clear, area);
+                let items: Vec<_> = targets.iter().map(|p| ListItem::new(p.name.clone())).collect();
+                let mut state = ListState::default().with_selected(Some(index));
+                frame.render_stateful_widget(List::new(items).block(tui::panel(" Link to speaker · ↑/↓ select · Enter save · Esc cancel ")).highlight_style(Style::default().bg(tui::SELECTED).fg(tui::ACCENT)).highlight_symbol("› "), area, &mut state);
+            }
             if let Some(name) = &editing {
                 let area = tui::centered(frame.area(),(65,9));
                 frame.render_widget(Clear,area);
@@ -79,6 +94,28 @@ pub fn run(paths: Paths) -> Result<()> {
             continue;
         };
         if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        if let Some(index) = linking {
+            match key.code {
+                KeyCode::Esc => linking = None,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    linking = Some((index + 1).min(targets.len().saturating_sub(1)))
+                }
+                KeyCode::Up | KeyCode::Char('k') => linking = Some(index.saturating_sub(1)),
+                KeyCode::Enter => {
+                    if let (Some(source), Some(target)) = (profile, targets.get(index)) {
+                        match speakers::link(&paths, &paths.load()?, &source.id, &target.id) {
+                            Ok(()) => {
+                                message = format!("Linked to {} · notes synchronized", target.name);
+                                linking = None;
+                            }
+                            Err(error) => message = format!("{error:#}"),
+                        }
+                    }
+                }
+                _ => {}
+            }
             continue;
         }
         if let Some(name) = &mut editing {
@@ -113,8 +150,13 @@ pub fn run(paths: Paths) -> Result<()> {
                 selection.select(Some((selected + 1).min(profiles.len().saturating_sub(1))))
             }
             KeyCode::Up | KeyCode::Char('k') => selection.select(Some(selected.saturating_sub(1))),
+            KeyCode::Char('l') => {
+                if profile.is_some() && !targets.is_empty() {
+                    linking = Some(0);
+                }
+            }
             KeyCode::Char('n') => {
-                if let Some(profile) = profile {
+                if let Some(profile) = profile.filter(|p| !p.id.starts_with("unknown:")) {
                     editing = Some(if profile.named {
                         profile.name.clone()
                     } else {
@@ -124,6 +166,10 @@ pub fn run(paths: Paths) -> Result<()> {
             }
             KeyCode::Enter => {
                 if let Some(profile) = profile {
+                    if profile.sample_path.is_empty() {
+                        message = "Unknown turn has no enrolled sample · press l to link it".into();
+                        continue;
+                    }
                     let start = || -> Result<Playback> {
                         let (stream, handle) =
                             OutputStream::try_default().context("Cannot open audio output")?;

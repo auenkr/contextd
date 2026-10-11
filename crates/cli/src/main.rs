@@ -118,6 +118,10 @@ enum Command {
 }
 #[derive(Subcommand)]
 enum SpeakerCommand {
+    /// List unknown turns and their linkable IDs.
+    Unknown,
+    /// Link a duplicate ID or unknown:TRANSCRIPT_ID:TURN_INDEX to an existing speaker.
+    Link { source: String, target: String },
     /// Rename a voice and synchronize its name in existing notes.
     Name { id: String, name: String },
     /// Retry interrupted name synchronization.
@@ -234,6 +238,15 @@ async fn main() -> Result<()> {
                         let settings = service.settings();
                         tokio::task::spawn_blocking(move || contextd_core::speakers::rename(&paths,&settings,&id,&name)).await??;
                         println!("Speaker name saved and notes synchronized");
+                    },
+                    Some(SpeakerCommand::Unknown) => {
+                        println!("{}", serde_json::to_string_pretty(&contextd_core::speakers::unknown_turns(&service.paths)?)?);
+                    },
+                    Some(SpeakerCommand::Link { source, target }) => {
+                        let paths = service.paths.clone();
+                        let settings = service.settings();
+                        tokio::task::spawn_blocking(move || contextd_core::speakers::link(&paths,&settings,&source,&target)).await??;
+                        println!("Speaker linked and notes synchronized");
                     },
                     Some(SpeakerCommand::Sync) => {
                         let paths = service.paths.clone();
