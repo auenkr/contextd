@@ -2,8 +2,23 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
+
+pub const ACCENT: Color = Color::Rgb(110, 220, 210);
+pub const BACKGROUND: Color = Color::Rgb(17, 23, 36);
+pub const PANEL: Color = Color::Rgb(24, 33, 49);
+pub const MUTED: Color = Color::Rgb(145, 160, 180);
+pub const SELECTED: Color = Color::Rgb(38, 67, 82);
+
+pub fn panel(title: impl Into<Line<'static>>) -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(66, 88, 110)))
+        .title_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(PANEL).fg(Color::White))
+        .title(title)
+}
 
 /// Shrink `area` to a centered box no larger than `max`, keeping a margin.
 pub fn centered(area: Rect, max: (u16, u16)) -> Rect {
@@ -33,6 +48,8 @@ pub fn help(frame: &mut ratatui::Frame<'_>, title: &str, lines: Vec<Line<'_>>) {
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .style(Style::default().bg(PANEL).fg(Color::White))
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(format!(" {title} ")),
         ),
@@ -46,6 +63,8 @@ pub fn help(frame: &mut ratatui::Frame<'_>, title: &str, lines: Vec<Line<'_>>) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .style(Style::default().bg(PANEL).fg(Color::White))
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
         rows[1],

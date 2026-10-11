@@ -179,7 +179,7 @@ impl Downloads {
                     },
                     Err(error) => Outcome {
                         finished: true,
-                        error: Some(error.to_string()),
+                        error: Some(format!("{error:#}")),
                     },
                 };
                 let _ = progress.send(outcome);

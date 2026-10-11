@@ -185,9 +185,20 @@ The browser refreshes every two seconds and uses the same data directory as reco
 | Whisper Tiny | 75 MB | Multilingual; smallest / fastest Whisper |
 | Whisper Base | 142 MB | Multilingual; balanced |
 | Whisper Small | 466 MB | Multilingual; higher accuracy |
+| Whisper Small Q8_0 | ~264 MB | Lower-memory multilingual Small |
+| Qwen3 ASR 0.6B | ~850 MB | Offline multilingual ASR; Hindi + English |
+| Nemotron 3.5 Streaming 0.6B | ~751 MB | Multilingual ASR with cache-aware streaming |
 | Whisper Large v3 Turbo | 1.6 GB | Multilingual; larger memory footprint |
+| Whisper Large v3 | 3.1 GB | Full multilingual model; accuracy-oriented alternative |
 
 Download and select a speech model with `contextd download <model-id> --select`. Switching replaces the previous loaded model. Apple Silicon builds enable Metal; other platforms use CPU by default. Parakeet Unified EN is English-only; select Whisper for other languages.
+
+For **Hindi + English**, press `v` in Setup or Config until the language is `hi-en`.
+The preset upgrades lightweight/English-only speech selections to Whisper Large-v3 and
+replaces S1-mini with lightweight multilingual Qwen3.5 0.8B. Mixed mode keeps English
+utterances working and retries Hindi when detection confuses it with another language.
+See [configuration](docs/CONFIGURATION.md#hindi--english) and the
+[real-model comparison](docs/HINDI_ENGLISH_EVALUATION.md) for outputs and measured errors.
 
 ### Optional cleanup LLM
 
@@ -199,7 +210,17 @@ Default: **"S1-mini" by "Superwhisper"**, downloaded as `s1-mini-q4_k_m.gguf`. T
 contextd download hf.co/superwhisper/s1-mini-GGUF:Q4_K_M --select
 ```
 
-This selects S1-mini for cleanup. Older cleanup model names from Ollama-based settings are migrated to S1-mini, the cleanup model currently supported by the embedded runtime.
+This selects S1-mini for cleanup. Unsupported legacy Ollama names are migrated to
+S1-mini; supported multilingual catalog selections survive restarts. Qwen3 4B Instruct
+2507, Qwen 2.5 1.5B/3B, and Llama 3.2 3B are also available locally.
+Qwen3.5 0.8B is available as GGUF (`qwen3.5:0.8b`) and Apple Silicon MLX
+(`qwen3.5:0.8b-mlx`). The lightweight model scored below 4B on cleanup fixtures.
+See [lightweight model results](docs/LIGHTWEIGHT_MODEL_EVALUATION.md).
+
+Config now exposes every setting, including preferred language, backend/source,
+storage paths, retention, and simultaneous microphone selections. It reloads external
+settings-file edits while idle. Use `contextd recommend` for device/language suggestions;
+storage changes apply after restart without moving existing files.
 
 The core uses S1-mini's documented training format, greedy decoding, and required empty thinking prefix through embedded llama.cpp. It uses `semi-formal` / `prose` / `general`. S1-mini needs this specialized format; it is not sent generic chat instructions or few-shot examples. Its style can also normalize spoken numbers and colloquial phrasing.
 
@@ -224,7 +245,7 @@ The `idle_unload_seconds` setting controls both engines:
 
 ## Recording behavior
 
-- Selected microphone, mono 16 kHz streaming resampling, energy-based segmentation.
+- Multiple selected microphones, independent mono 16 kHz resampling, Silero speech-aware segmentation.
 - Default pause boundary: 1.4 seconds. Continuous sound stays in one segment until a pause or recording stops; there is no timed cutoff.
 - Recognition runs after that boundary. For audio longer than 30 seconds, streaming-capable models use one streaming recognition session with internal audio windows; these do not split the saved entry or trigger cleanup. Other models use their whole-buffer recognition path. Active audio stays in memory until the pause, then enters the durable processing queue.
 - Cleanup receives the complete transcript when it fits its 4,096-token context (including prompt and output). Longer transcripts are split near sentence/paragraph boundaries and cleaned parts are saved together as one entry.
@@ -233,7 +254,7 @@ The `idle_unload_seconds` setting controls both engines:
 - Empty output from the cleanup model is discarded before saving, with no word or phrase blacklist. Set `short_transcript_policy` to `skip_all` to discard every 1–3-word transcript, or `keep` to disable filtering; see [configuration](docs/CONFIGURATION.md#skip-brief-filler).
 - Raw WAV clips can optionally be retained alongside text. Deleting a memory removes its retained clip and updates the daily file.
 
-This captures microphone audio, including voices/background sounds reaching that microphone. It does not capture system audio, screens, or identify speakers. Energy detection may need threshold tuning for a noisy room or quiet voice. Suspend/sleep pauses the OS's audio capture; the app cannot record while the laptop sleeps. Abrupt termination can lose the currently unfinished segment; completed queued segments are recoverable.
+This captures microphone audio, including voices/background sounds reaching the selected inputs. It does not capture system audio, screens, or identify speakers. Speech confidence and minimum energy may need tuning for a noisy room or quiet voice. Synthetic fan-noise tests pass; the user's actual fan and simultaneous live inputs still need microphone-permitted testing. Suspend/sleep pauses the OS's audio capture; the app cannot record while the laptop sleeps. Abrupt termination can lose the currently unfinished segment; completed queued segments are recoverable.
 
 On macOS, capture checks microphone authorization and requests access before opening the input stream. For an embedded terminal, allow its host app (such as T3 Code) under **System Settings → Privacy & Security → Microphone**. If access was denied, enable it there and restart the host app. Activity logs show RMS in scientific notation so quiet input is distinguishable from exact zeros, and report missing buffers or zero-valued input explicitly.
 

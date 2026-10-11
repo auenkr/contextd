@@ -46,6 +46,12 @@ enum Command {
     /// Show the resolved config, data, cache, and log directories.
     Paths,
     Models,
+    /// Show device capabilities and recommended models for the preferred language.
+    Recommend,
+    /// Remove an unused cached model (selected models are protected).
+    RemoveModel {
+        id: String,
+    },
     /// Download one or more models; multiple downloads run at the same time.
     Download {
         /// Model IDs from the catalog, for example parakeet-unified-en-0.6b whisper-tiny
@@ -105,7 +111,8 @@ async fn main() -> Result<()> {
         if args.retain_audio || args.no_retain_audio {
             anyhow::bail!("Audio retention flags apply to recording; use config to change them");
         }
-        let paths = contextd_core::Paths::discover()?;
+        let mut paths = contextd_core::Paths::discover()?;
+        paths.apply_storage(&paths.load()?)?;
         return tokio::task::spawn_blocking(move || explore::run(paths)).await?;
     }
     let service = Service::new()?;
@@ -203,6 +210,19 @@ async fn main() -> Result<()> {
                     let models = models::list(&service.paths).await?;
                     println!("{}", serde_json::to_string_pretty(&models)?);
                 }
+                Command::Recommend => {
+                    let device = contextd_core::device::DeviceProfile::detect();
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({"recommendation":device.recommend(&service.settings()), "device":device}))?);
+                }
+                Command::RemoveModel { id } => {
+                    let settings = service.settings();
+                    let id = models::canonical_cleanup_id(&id);
+                    if id == settings.speech_model || id == models::canonical_cleanup_id(&settings.filter_model) {
+                        anyhow::bail!("Select another model before deleting the selected cache");
+                    }
+                    models::delete(&service.paths, id)?;
+                    eprintln!("Removed cached model: {id}");
+                }
                 Command::Download { ids, select } => {
                     // Queue every model before waiting, so transfers overlap.
                     for id in &ids {
@@ -224,6 +244,8 @@ async fn main() -> Result<()> {
                             settings.speech_model = id.clone();
                         } else {
                             settings.filter_model = id.clone();
+                            settings.cleanup_source = None;
+                            settings.cleanup_backend = contextd_core::config::CleanupBackend::Auto;
                         }
                         service.save_settings(settings).await?;
                     }

@@ -22,6 +22,8 @@ pub struct Transcript {
     pub duration_seconds: f64,
     pub audio_path: Option<String>,
     pub filter_error: Option<String>,
+    #[serde(default)]
+    pub microphone: Option<String>,
 }
 
 pub struct History(Connection, Paths);
@@ -151,6 +153,10 @@ impl History {
                 entry.created_at,
                 entry.refined
             ));
+            if let Some(microphone) = &entry.microphone {
+                let microphone = microphone.replace(['\r', '\n'], " ").replace('`', "\\`");
+                text.push_str(&format!("Source microphone: {microphone}\n\n"));
+            }
             if entry.refined != entry.raw {
                 text.push_str(&format!(
                     "<details>\n<summary>Original transcript</summary>\n\n{}\n\n</details>\n\n",
@@ -203,6 +209,7 @@ mod tests {
             duration_seconds: 5.0,
             audio_path: None,
             filter_error: None,
+            microphone: None,
         };
         history.insert(&entry).unwrap();
         // Replaying a completed durable job must not duplicate the note or FTS row.
@@ -255,6 +262,7 @@ mod tests {
                     duration_seconds: 0.0,
                     audio_path: None,
                     filter_error: None,
+                    microphone: None,
                 })
                 .unwrap();
         }

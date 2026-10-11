@@ -337,16 +337,17 @@ pub fn run(
             } else {
                 "Paused"
             };
-            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(" contextd ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), Span::styled(format!("  {state}  ·  {}  ·  input {:.4}", if processing { "Processing speech" } else { "Waiting for speech" }, level), Style::default().fg(if recording { Color::Green } else { Color::Yellow }))])).block(Block::bordered().border_style(Style::default().fg(Color::Blue))), rows[0]);
+            frame.render_widget(Block::default().style(Style::default().bg(tui::BACKGROUND)), frame.area());
+            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(" ◆ contextd ", Style::default().fg(tui::ACCENT).add_modifier(Modifier::BOLD)), Span::styled(format!("  {state}  ·  {}  ·  input {:.4}", if processing { "Processing speech" } else { "Waiting for speech" }, level), Style::default().fg(if recording { Color::Green } else { Color::Yellow }))])).block(tui::panel(" Local • private • on-device ")), rows[0]);
             let columns = Layout::horizontal([Constraint::Length(26), Constraint::Min(20)]).split(rows[1]);
-            frame.render_stateful_widget(List::new(actions.into_iter().map(ListItem::new).collect::<Vec<_>>()).highlight_symbol("› ").highlight_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray).add_modifier(Modifier::BOLD)).block(Block::bordered().title(" Navigation ").border_style(Style::default().fg(Color::Blue))), columns[0], &mut selection);
+            frame.render_stateful_widget(List::new(actions.into_iter().map(ListItem::new).collect::<Vec<_>>()).highlight_symbol("› ").highlight_style(Style::default().fg(tui::ACCENT).bg(tui::SELECTED).add_modifier(Modifier::BOLD)).block(tui::panel(" Navigation ")), columns[0], &mut selection);
             if setup {
                 frame.render_widget(Paragraph::new(format!("Welcome to contextd\n\nChoose your settings before recording starts.\n\nSpeech model: {}\n  h / l or ← / →: choose speech model · ? for help\n\nCleanup: {} · {}\n  c: enable / disable · f: choose cleanup model\n\nKeep audio clips: {}\n  a: toggle WAV retention\n\nMicrophone: {}\n  m: cycle available microphones\n\nEnter: save setup, download missing models, and begin\n\nModel downloads show live progress below.{}", settings.speech_model, if settings.filter_enabled { "enabled" } else { "disabled" }, models::catalog(&service.paths).iter().find(|m| m.id == models::canonical_cleanup_id(&settings.filter_model)).map(|m| format!("{} (~{} MB)", m.name, m.size_mb)).unwrap_or_else(|| settings.filter_model.clone()), settings.retain_audio, settings.microphone.as_deref().unwrap_or("System default"), if first_run { "\n\nBackspace / Esc aborts setup and exits; nothing is saved." } else { "\n\nBackspace / Esc goes back to recording; unsaved changes are discarded." })).wrap(Wrap { trim: false }).block(Block::bordered().title(" Setup ").border_style(Style::default().fg(Color::Cyan))), columns[1]);
             } else {
                 let paragraph = Paragraph::new(logs.iter().cloned().collect::<Vec<_>>()).wrap(Wrap { trim: false });
                 let max = paragraph.line_count(columns[1].width.saturating_sub(2).max(1)).saturating_sub(usize::from(columns[1].height.saturating_sub(2))).min(u16::MAX as usize) as u16;
                 scroll = scroll.min(max);
-                frame.render_widget(paragraph.scroll((max.saturating_sub(scroll), 0)).block(Block::bordered().title(" Live processing log ").border_style(Style::default().fg(Color::Green))), columns[1]);
+                frame.render_widget(paragraph.scroll((max.saturating_sub(scroll), 0)).block(tui::panel(" Live processing log ")), columns[1]);
             }
             if let Some((id, progress)) = downloads.snapshot().first() {
                 let ratio = (progress.percent() / 100.0).min(1.0);
@@ -355,16 +356,16 @@ pub fn run(
                     .label(if queued { format!("{id}: waiting for a free download slot") } else {
                         format!("{id}: {:.0}% · {:.1} / {:.1} MB · {}", progress.percent(), progress.completed as f64 / 1e6, progress.total as f64 / 1e6, if setup && !first_run { "Esc: cancel and go back" } else { "q: cancel and exit" })
                     })
-                    .block(Block::bordered().title(format!(" Downloading {id} "))), rows[2]);
+                    .block(tui::panel(format!(" Downloading {id} "))), rows[2]);
             } else {
-                frame.render_widget(Paragraph::new(if setup { logs.back().map(ToString::to_string).unwrap_or_default() } else { format!("Models: {} · cleanup {}", settings.speech_model, if settings.filter_enabled { settings.filter_model.as_str() } else { "disabled" }) }).block(Block::bordered().title(" Local processing ")), rows[2]);
+                 frame.render_widget(Paragraph::new(if setup { format!("Language: {} · v: auto / English / Hindi / Hindi + English", settings.language) } else { format!("Models: {} · language {} · cleanup {}", settings.speech_model, settings.language, if settings.filter_enabled { settings.filter_model.as_str() } else { "disabled" }) }).block(tui::panel(" Local processing ")), rows[2]);
             }
             let hints: Vec<Span> = if downloads.any_active() {
                 vec![Span::raw("hjkl / arrows: navigate · "), Span::styled("?: help", Style::default().fg(Color::Yellow)), Span::raw(if setup && !first_run { " · Esc / Backspace: cancel and go back" } else { " · q: cancel and exit" })]
             } else {
                 vec![Span::raw("hjkl / arrows: navigate · "), Span::styled("?: help", Style::default().fg(Color::Yellow)), Span::raw(" · Enter: open · Backspace: back · q / Esc: stop and exit")]
             };
-            frame.render_widget(Paragraph::new(Line::from(hints)).style(Style::default().fg(Color::Gray)), rows[3]);
+            frame.render_widget(Paragraph::new(Line::from(hints)).style(Style::default().fg(tui::MUTED)), rows[3]);
             if help {
                 tui::help(frame, "Dashboard help", vec![
                     tui::section("Navigation"),
@@ -377,7 +378,8 @@ pub fn run(
                     tui::keys("c", "Enable or disable cleanup"),
                     tui::keys("f", "Cycle cleanup models"),
                     tui::keys("a", "Toggle audio clip retention"),
-                    tui::keys("m", "Cycle microphones"),
+                     tui::keys("m", "Cycle microphones"),
+                     tui::keys("v", "Cycle language; Hindi presets select multilingual models"),
                     tui::section("Live processing log"),
                     tui::keys("PgUp / PgDn", "Scroll back and forward"),
                     tui::keys("Ctrl+u / Ctrl+d", "Scroll by ten lines"),
@@ -506,6 +508,7 @@ pub fn run(
                 settings.filter_model = catalog[(index + 1) % catalog.len()].id.clone();
             }
             KeyCode::Char('a') if setup => settings.retain_audio = !settings.retain_audio,
+            KeyCode::Char('v') if setup => settings.cycle_language(),
             KeyCode::Backspace if setup && !first_run => {
                 setup = false;
                 settings = service.settings();

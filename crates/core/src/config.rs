@@ -16,17 +16,35 @@ pub enum ShortTranscriptPolicy {
     SkipAll,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupBackend {
+    #[default]
+    Auto,
+    Gguf,
+    Mlx,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub microphone: Option<String>,
+    pub microphones: Vec<String>,
     pub speech_model: String,
     pub filter_model: String,
     pub filter_enabled: bool,
     pub language: String,
+    pub preferred_language: String,
+    pub cleanup_backend: CleanupBackend,
+    pub cleanup_source: Option<String>,
+    pub mlx_python: Option<PathBuf>,
+    pub data_directory: Option<PathBuf>,
+    pub cache_directory: Option<PathBuf>,
+    pub logs_directory: Option<PathBuf>,
     pub idle_unload_seconds: u64,
     pub silence_ms: u64,
     pub speech_threshold: f32,
+    pub vad_threshold: f32,
     pub retain_audio: bool,
     pub short_transcript_policy: ShortTranscriptPolicy,
 }
@@ -35,13 +53,22 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             microphone: None,
+            microphones: Vec::new(),
             speech_model: "parakeet-unified-en-0.6b".into(),
             filter_model: crate::models::DEFAULT_FILTER_MODEL.into(),
             filter_enabled: false,
             language: "auto".into(),
+            preferred_language: "auto".into(),
+            cleanup_backend: CleanupBackend::Auto,
+            cleanup_source: None,
+            mlx_python: None,
+            data_directory: None,
+            cache_directory: None,
+            logs_directory: None,
             idle_unload_seconds: 120,
             silence_ms: 1400,
             speech_threshold: 0.012,
+            vad_threshold: 0.6,
             retain_audio: false,
             short_transcript_policy: ShortTranscriptPolicy::default(),
         }
@@ -49,10 +76,94 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn selected_microphones(&self) -> Vec<Option<String>> {
+        if self.microphones.is_empty() {
+            vec![self.microphone.clone()]
+        } else {
+            self.microphones.iter().cloned().map(Some).collect()
+        }
+    }
+    pub fn uses_mlx(&self) -> bool {
+        self.cleanup_backend == CleanupBackend::Mlx
+            || self.cleanup_backend == CleanupBackend::Auto && self.filter_model.ends_with("-mlx")
+    }
+    pub fn speech_language(&self) -> &str {
+        if self.language == "auto" {
+            &self.preferred_language
+        } else {
+            &self.language
+        }
+    }
+    /// UI presets; other Whisper ISO language codes remain available through JSON.
+    pub fn cycle_language(&mut self) {
+        self.language = match self.language.as_str() {
+            "auto" => "en",
+            "en" => "hi",
+            "hi" => "hi-en",
+            _ => "auto",
+        }
+        .into();
+        if matches!(self.language.as_str(), "hi" | "hi-en") {
+            if self.speech_model.starts_with("parakeet-")
+                || matches!(
+                    self.speech_model.as_str(),
+                    "whisper-tiny" | "whisper-base" | "whisper-small"
+                )
+            {
+                self.speech_model = "whisper-large-v3".into();
+            }
+            if crate::models::is_s1_model(&self.filter_model) {
+                self.filter_model = "qwen3.5:0.8b".into();
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
+        if self.language.trim().is_empty() || self.preferred_language.trim().is_empty() {
+            bail!("Language settings must be auto, hi-en, or a model-supported language code");
+        }
+        if let Some(source) = &self.cleanup_source {
+            if source.trim().is_empty() {
+                bail!("cleanup_source cannot be empty; use null to clear it");
+            }
+        } else {
+            if self.cleanup_backend == CleanupBackend::Mlx && !self.filter_model.ends_with("-mlx") {
+                bail!("Select an MLX cleanup model or provide an MLX cleanup_source");
+            }
+            if self.cleanup_backend == CleanupBackend::Gguf && self.filter_model.ends_with("-mlx") {
+                bail!("Select a GGUF cleanup model for the GGUF backend");
+            }
+        }
+        for directory in [
+            &self.data_directory,
+            &self.cache_directory,
+            &self.logs_directory,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !directory.is_absolute() {
+                bail!("Storage directories must be absolute paths");
+            }
+        }
+        let mut inputs = std::collections::HashSet::new();
+        if self
+            .microphones
+            .iter()
+            .any(|id| id.is_empty() || !inputs.insert(id))
+        {
+            bail!("Microphone IDs must be nonempty and unique");
+        }
+        if self.speech_model.starts_with("parakeet-")
+            && !matches!(self.speech_language(), "auto" | "en")
+        {
+            bail!("Parakeet supports English only. Select Whisper for Hindi + English.");
+        }
         if !(300..=5000).contains(&self.silence_ms)
             || !self.speech_threshold.is_finite()
             || !(0.001..=0.2).contains(&self.speech_threshold)
+            || !self.vad_threshold.is_finite()
+            || !(0.1..=0.95).contains(&self.vad_threshold)
             || self.idle_unload_seconds > 86400
         {
             bail!("Invalid segmentation or idle-unload settings");
@@ -90,6 +201,19 @@ impl Paths {
     }
     pub fn models_dir(&self) -> PathBuf {
         self.cache_dir.join("models")
+    }
+    pub fn apply_storage(&mut self, settings: &Settings) -> Result<()> {
+        settings.validate()?;
+        if let Some(path) = &settings.data_directory {
+            self.root = path.clone();
+        }
+        if let Some(path) = &settings.cache_directory {
+            self.cache_dir = path.clone();
+        }
+        if let Some(path) = &settings.logs_directory {
+            self.logs_dir = path.clone();
+        }
+        self.ensure_dirs()
     }
     pub fn discover() -> Result<Self> {
         if let Some(root) =
@@ -286,11 +410,18 @@ impl Paths {
         } else {
             Settings::default()
         };
-        if settings.filter_model != crate::models::DEFAULT_FILTER_MODEL {
-            // Older releases stored Ollama model names here. The embedded
-            // runtime currently supports S1-mini only, so move that preference
-            // to the supported catalog model and persist the migration.
-            settings.filter_model = crate::models::DEFAULT_FILTER_MODEL.into();
+        let canonical = if settings.cleanup_source.is_some()
+            || crate::models::cleanup_path(self, &settings.filter_model).is_ok()
+        {
+            crate::models::canonical_cleanup_id(&settings.filter_model)
+        } else {
+            // Migrate unsupported legacy Ollama names, not supported catalog
+            // selections. Resetting all non-S1 IDs silently undid model choices.
+            crate::models::DEFAULT_FILTER_MODEL
+        }
+        .to_owned();
+        if settings.filter_model != canonical {
+            settings.filter_model = canonical;
             self.save(&settings)?;
         }
         Ok(settings)
@@ -359,4 +490,81 @@ fn copy_path(source: &std::path::Path, destination: &std::path::Path) -> Result<
         std::fs::copy(source, destination)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferred_language_and_multiple_inputs_preserve_legacy_defaults() {
+        let mut settings: Settings =
+            serde_json::from_str(r#"{"microphone":"legacy","speech_model":"whisper-small"}"#)
+                .unwrap();
+        assert_eq!(settings.selected_microphones(), vec![Some("legacy".into())]);
+        settings.microphones = vec!["first".into(), "second".into()];
+        settings.preferred_language = "hi-en".into();
+        assert_eq!(settings.speech_language(), "hi-en");
+        assert_eq!(
+            settings.selected_microphones(),
+            vec![Some("first".into()), Some("second".into())]
+        );
+        settings.language = "en".into();
+        assert_eq!(settings.speech_language(), "en");
+        settings.microphones.push("first".into());
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn storage_overrides_keep_config_in_place_and_do_not_move_archives() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut paths = Paths::in_directory(directory.path().join("original"));
+        paths.ensure_dirs().unwrap();
+        std::fs::write(paths.root.join("notes/existing.md"), "preserved").unwrap();
+        let settings = Settings {
+            data_directory: Some(directory.path().join("data")),
+            cache_directory: Some(directory.path().join("cache")),
+            logs_directory: Some(directory.path().join("logs")),
+            ..Settings::default()
+        };
+        paths.save(&settings).unwrap();
+        let config_path = paths.settings_path();
+        paths.apply_storage(&settings).unwrap();
+        assert_eq!(paths.settings_path(), config_path);
+        assert_eq!(paths.root, settings.data_directory.unwrap());
+        assert!(paths.models_dir().is_dir());
+        assert!(directory.path().join("original/notes/existing.md").exists());
+    }
+
+    #[test]
+    fn supported_cleanup_selections_survive_restarts() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths::in_directory(directory.path());
+        paths.ensure_dirs().unwrap();
+        for model in crate::models::catalog(&paths)
+            .into_iter()
+            .filter(|m| m.kind == "filter")
+        {
+            let settings = Settings {
+                filter_model: model.id.clone(),
+                filter_enabled: true,
+                ..Settings::default()
+            };
+            paths.save(&settings).unwrap();
+            assert_eq!(paths.load().unwrap().filter_model, model.id);
+            assert_eq!(paths.load().unwrap().filter_model, model.id);
+        }
+        for alias in ["s1-mini", "s1-mini:latest", "old-ollama-model"] {
+            paths
+                .save(&Settings {
+                    filter_model: alias.into(),
+                    ..Settings::default()
+                })
+                .unwrap();
+            assert_eq!(
+                paths.load().unwrap().filter_model,
+                crate::models::DEFAULT_FILTER_MODEL
+            );
+        }
+    }
 }

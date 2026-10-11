@@ -16,6 +16,10 @@ pub struct Capture {
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
+pub struct InputAudio {
+    pub source: usize,
+    pub samples: Vec<f32>,
+}
 #[derive(Clone, serde::Serialize)]
 pub struct Microphone {
     pub id: String,
@@ -47,6 +51,29 @@ impl Capture {
         sender: mpsc::Sender<Vec<f32>>,
         errors: mpsc::UnboundedSender<String>,
     ) -> Result<Self> {
+        Self::start_with(
+            microphone,
+            move |samples| sender.try_send(samples).is_ok(),
+            errors,
+        )
+    }
+    pub fn start_tagged(
+        microphone: Option<String>,
+        source: usize,
+        sender: mpsc::Sender<InputAudio>,
+        errors: mpsc::UnboundedSender<String>,
+    ) -> Result<Self> {
+        Self::start_with(
+            microphone,
+            move |samples| sender.try_send(InputAudio { source, samples }).is_ok(),
+            errors,
+        )
+    }
+    fn start_with(
+        microphone: Option<String>,
+        deliver: impl FnMut(Vec<f32>) -> bool + Send + 'static,
+        errors: mpsc::UnboundedSender<String>,
+    ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -75,19 +102,19 @@ impl Capture {
                 let stream = match config.sample_format() {
                     cpal::SampleFormat::F32 => device.build_input_stream(
                         &config.clone().into(),
-                        callback::<f32>(sender, errors.clone(), channels, rate),
+                        callback::<f32>(deliver, errors.clone(), channels, rate),
                         err,
                         None,
                     )?,
                     cpal::SampleFormat::I16 => device.build_input_stream(
                         &config.clone().into(),
-                        callback::<i16>(sender, errors.clone(), channels, rate),
+                        callback::<i16>(deliver, errors.clone(), channels, rate),
                         err,
                         None,
                     )?,
                     cpal::SampleFormat::U16 => device.build_input_stream(
                         &config.clone().into(),
-                        callback::<u16>(sender, errors.clone(), channels, rate),
+                        callback::<u16>(deliver, errors.clone(), channels, rate),
                         err,
                         None,
                     )?,
@@ -173,7 +200,7 @@ fn ensure_microphone_access() -> Result<()> {
 }
 
 fn callback<T>(
-    sender: mpsc::Sender<Vec<f32>>,
+    mut deliver: impl FnMut(Vec<f32>) -> bool + Send + 'static,
     errors: mpsc::UnboundedSender<String>,
     channels: usize,
     rate: u32,
@@ -198,7 +225,7 @@ where
             .collect();
         let samples = resampler.push(&mono);
         // Never block the real-time callback; make an overflow visible once per burst.
-        if sender.try_send(samples).is_err() {
+        if !deliver(samples) {
             if !reported_overflow {
                 let _ = errors.send(
                     "Microphone buffer overflow: some audio was lost. Reduce system load.".into(),
@@ -242,14 +269,30 @@ impl Resampler {
     }
 }
 
+struct SpeechDetector(silero_vad_crs::SileroVad);
+// SAFETY: the native detector owns its model and all recurrent/scratch buffers.
+// Embedded weights are immutable. Moving ownership between threads is safe;
+// calls require &mut self and the detector is never shared concurrently.
+unsafe impl Send for SpeechDetector {}
+
 pub struct Segmenter {
+    detector: SpeechDetector,
+    pending: VecDeque<f32>,
     pre: VecDeque<f32>,
     samples: Vec<f32>,
     silence: usize,
     voiced: usize,
     settings: Settings,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
+    stream_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    processed_samples: usize,
+    onset_samples: usize,
+    last_probability: f32,
 }
+const VAD_FRAME_SAMPLES: usize = 512; // 32 ms at 16 kHz.
+const SPEECH_ONSET_SAMPLES: usize = 4 * VAD_FRAME_SAMPLES; // 128 ms of consecutive speech.
+const MIN_SPEECH_SAMPLES: usize = 4000; // Keep the existing 250 ms minimum.
+const PRE_ROLL_SAMPLES: usize = 4800; // Preserve word onsets during confirmation.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Segment {
     pub samples: Vec<f32>,
@@ -259,34 +302,91 @@ impl Segmenter {
     pub fn is_active(&self) -> bool {
         self.started_at.is_some()
     }
-    pub fn new(settings: Settings) -> Self {
-        Self {
+    pub fn last_speech_probability(&self) -> f32 {
+        self.last_probability
+    }
+    pub fn new(settings: Settings) -> Result<Self> {
+        Ok(Self {
+            detector: SpeechDetector(
+                silero_vad_crs::SileroVad::new()
+                    .context("Could not initialize embedded speech detector")?,
+            ),
+            pending: VecDeque::new(),
             pre: VecDeque::new(),
             samples: vec![],
             silence: 0,
             voiced: 0,
             settings,
             started_at: None,
-        }
+            stream_started_at: None,
+            processed_samples: 0,
+            onset_samples: 0,
+            last_probability: 0.0,
+        })
     }
-    pub fn push(&mut self, samples: &[f32]) -> Option<Segment> {
-        let rms = rms(samples);
-        let speech = rms > self.settings.speech_threshold;
-        if self.samples.is_empty() && !speech {
+    pub fn push(&mut self, samples: &[f32]) -> Result<Vec<Segment>> {
+        if self.stream_started_at.is_none() && !samples.is_empty() {
+            self.stream_started_at = Some(
+                chrono::Utc::now()
+                    - chrono::Duration::microseconds((samples.len() as i64 * 1000) / 16),
+            );
+        }
+        self.pending.extend(samples);
+        let mut segments = Vec::new();
+        while self.pending.len() >= VAD_FRAME_SAMPLES {
+            let mut frame = [0.0; VAD_FRAME_SAMPLES];
+            for sample in &mut frame {
+                *sample = self.pending.pop_front().unwrap();
+            }
+            if let Some(segment) = self.process_frame(&frame, frame.len())? {
+                segments.push(segment);
+            }
+        }
+        Ok(segments)
+    }
+    fn process_frame(
+        &mut self,
+        frame: &[f32; VAD_FRAME_SAMPLES],
+        actual_samples: usize,
+    ) -> Result<Option<Segment>> {
+        // Always advance the recurrent detector, including during silence, so
+        // its background-noise context does not become stale.
+        self.last_probability = self.detector.0.forward_chunk(frame)?;
+        let threshold = if self.is_active() {
+            (self.settings.vad_threshold - 0.15).max(0.05)
+        } else {
+            self.settings.vad_threshold
+        };
+        let samples = &frame[..actual_samples];
+        let speech =
+            self.last_probability >= threshold && rms(samples) > self.settings.speech_threshold;
+        Ok(self.push_classified_frame(samples, speech))
+    }
+    fn push_classified_frame(&mut self, samples: &[f32], speech: bool) -> Option<Segment> {
+        self.processed_samples += samples.len();
+        if self.samples.is_empty() {
             self.pre.extend(samples);
-            while self.pre.len() > 4800 {
+            while self.pre.len() > PRE_ROLL_SAMPLES {
                 self.pre.pop_front();
             }
-            return None;
-        }
-        if self.samples.is_empty() {
+            self.onset_samples = if speech {
+                self.onset_samples + samples.len()
+            } else {
+                0
+            };
+            if self.onset_samples < SPEECH_ONSET_SAMPLES {
+                return None;
+            }
             self.started_at = Some(
-                chrono::Utc::now()
-                    - chrono::Duration::milliseconds(
-                        ((self.pre.len() + samples.len()) / 16) as i64,
+                self.stream_started_at.unwrap_or_else(chrono::Utc::now)
+                    + chrono::Duration::microseconds(
+                        ((self.processed_samples - self.pre.len()) as i64 * 1000) / 16,
                     ),
             );
             self.samples.extend(self.pre.drain(..));
+            self.voiced = self.onset_samples;
+            self.onset_samples = 0;
+            return None;
         }
         self.samples.extend_from_slice(samples);
         if speech {
@@ -296,16 +396,30 @@ impl Segmenter {
             self.silence += samples.len();
         }
         if self.silence >= self.settings.silence_ms as usize * 16 {
-            return self.flush();
+            return self.finish_segment();
         }
         None
     }
-    pub fn flush(&mut self) -> Option<Segment> {
+    pub fn flush(&mut self) -> Result<Option<Segment>> {
+        if !self.pending.is_empty() {
+            let actual_samples = self.pending.len();
+            let mut frame = [0.0; VAD_FRAME_SAMPLES];
+            for sample in &mut frame[..actual_samples] {
+                *sample = self.pending.pop_front().unwrap();
+            }
+            if let Some(segment) = self.process_frame(&frame, actual_samples)? {
+                return Ok(Some(segment));
+            }
+        }
+        Ok(self.finish_segment())
+    }
+    fn finish_segment(&mut self) -> Option<Segment> {
         let samples = std::mem::take(&mut self.samples);
         let voiced = std::mem::replace(&mut self.voiced, 0);
         self.silence = 0;
+        self.onset_samples = 0;
         let started_at = self.started_at.take().unwrap_or_else(chrono::Utc::now);
-        if voiced >= 4000 {
+        if voiced >= MIN_SPEECH_SAMPLES {
             Some(Segment {
                 samples,
                 started_at,
@@ -314,6 +428,18 @@ impl Segmenter {
             None
         }
     }
+}
+
+/// Screen imported audio and old queued jobs before loading a transcription
+/// model. Stop as soon as a minimum-duration speech segment is confirmed.
+pub fn has_speech(samples: &[f32], settings: &Settings) -> Result<bool> {
+    let mut segmenter = Segmenter::new(settings.clone())?;
+    for frame in samples.chunks(VAD_FRAME_SAMPLES) {
+        if !segmenter.push(frame)?.is_empty() || segmenter.voiced >= MIN_SPEECH_SAMPLES {
+            return Ok(true);
+        }
+    }
+    Ok(segmenter.flush()?.is_some())
 }
 pub fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
@@ -375,33 +501,96 @@ mod tests {
     }
     #[test]
     fn silence_is_discarded_and_speech_flushed() {
-        let mut segmenter = Segmenter::new(Settings::default());
+        let mut segmenter = Segmenter::new(Settings::default()).unwrap();
         for _ in 0..100 {
-            assert!(segmenter.push(&[0.0; 1600]).is_none());
+            assert!(segmenter.push(&[0.0; 1600]).unwrap().is_empty());
         }
+        // Test segmentation independently of classification; a constant DC
+        // signal is not human speech and must not be used as a VAD fixture.
         for _ in 0..5 {
-            assert!(segmenter.push(&[0.1; 1600]).is_none());
+            assert!(segmenter
+                .push_classified_frame(&[0.1; 1600], true)
+                .is_none());
         }
         let mut segment = None;
         for _ in 0..14 {
-            segment = segmenter.push(&[0.0; 1600]);
+            segment = segmenter.push_classified_frame(&[0.0; 1600], false);
         }
         assert!(segment.unwrap().samples.len() <= 35200);
-        assert!(segmenter.flush().is_none());
+        assert!(segmenter.flush().unwrap().is_none());
     }
 
     #[test]
-    fn continuous_sound_stays_in_one_segment_until_a_pause() {
-        let mut segmenter = Segmenter::new(Settings::default());
+    fn continuous_confirmed_speech_stays_in_one_segment_until_a_pause() {
+        let mut segmenter = Segmenter::new(Settings::default()).unwrap();
         for _ in 0..650 {
-            assert!(segmenter.push(&[0.1; 1600]).is_none());
+            assert!(segmenter
+                .push_classified_frame(&[0.1; 1600], true)
+                .is_none());
         }
         assert!(segmenter.is_active());
         for _ in 0..13 {
-            assert!(segmenter.push(&[0.0; 1600]).is_none());
+            assert!(segmenter
+                .push_classified_frame(&[0.0; 1600], false)
+                .is_none());
         }
-        let segment = segmenter.push(&[0.0; 1600]).unwrap();
+        let segment = segmenter
+            .push_classified_frame(&[0.0; 1600], false)
+            .unwrap();
         assert_eq!(segment.samples.len(), 664 * 1600);
         assert!(!segmenter.is_active());
+    }
+
+    #[test]
+    fn short_detection_spikes_do_not_start_capture_and_pre_roll_keeps_word_onsets() {
+        let mut segmenter = Segmenter::new(Settings::default()).unwrap();
+        for _ in 0..12 {
+            segmenter.push_classified_frame(&[0.01; VAD_FRAME_SAMPLES], false);
+        }
+        for _ in 0..3 {
+            segmenter.push_classified_frame(&[0.1; VAD_FRAME_SAMPLES], true);
+            assert!(!segmenter.is_active());
+        }
+        segmenter.push_classified_frame(&[0.01; VAD_FRAME_SAMPLES], false);
+        assert!(!segmenter.is_active());
+        assert!(segmenter.flush().unwrap().is_none());
+        for _ in 0..8 {
+            segmenter.push_classified_frame(&[0.1; VAD_FRAME_SAMPLES], true);
+        }
+        let segment = segmenter.flush().unwrap().unwrap();
+        assert_eq!(
+            segment.samples.len(),
+            PRE_ROLL_SAMPLES + 4 * VAD_FRAME_SAMPLES
+        );
+        assert!(segment.samples[PRE_ROLL_SAMPLES - SPEECH_ONSET_SAMPLES..]
+            .iter()
+            .all(|sample| *sample == 0.1));
+    }
+
+    #[test]
+    fn loud_fan_like_noise_and_dc_do_not_start_or_queue_speech() {
+        let mut state = 17u32;
+        let mut lowpass = 0.0;
+        let noise: Vec<f32> = (0..8 * 16000)
+            .map(|i| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let white = state as f32 / u32::MAX as f32 * 2.0 - 1.0;
+                lowpass = 0.9 * lowpass + 0.1 * white;
+                let t = i as f32 / 16000.0;
+                let phase = 2.0 * std::f32::consts::PI * t;
+                (0.25 * lowpass + 0.035 * (100.0 * phase).sin() + 0.015 * (200.0 * phase).sin())
+                    * (1.0 + 0.4 * (0.27 * phase).sin())
+            })
+            .collect();
+        assert!(rms(&noise) > Settings::default().speech_threshold);
+        for samples in [&noise[..], &vec![0.1; 16000][..]] {
+            let mut segmenter = Segmenter::new(Settings::default()).unwrap();
+            for chunk in samples.chunks(193) {
+                assert!(segmenter.push(chunk).unwrap().is_empty());
+                assert!(!segmenter.is_active());
+            }
+            assert!(segmenter.flush().unwrap().is_none());
+            assert!(!has_speech(samples, &Settings::default()).unwrap());
+        }
     }
 }

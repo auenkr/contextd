@@ -10,20 +10,32 @@ Downloads run in the background: pick several uncached models from the model scr
 
 Press `d` in the model screen to delete a cached model and reclaim disk space. The model currently in use is protected, so select a different one first; other cached models are removed together with any partial download.
 
-During setup, `h`/`l` or the left/right arrows choose the speech model, `f` cycles cleanup models, `c` toggles cleanup, `a` toggles audio retention, and `m` cycles microphones. Choose **Setup** later to revisit these options. Config pauses capture and finishes queued work before editing; returning resumes recording. Explore notes keeps capture running.
+During setup, `h`/`l` or the left/right arrows choose the speech model, `f` cycles cleanup models, `c` toggles cleanup, `a` toggles audio retention, `m` cycles microphones, and `v` cycles language presets. Choose **Setup** later to revisit these options. Config pauses capture and finishes queued work before editing; returning resumes recording. Explore notes keeps capture running.
 
 ## Edit settings
 
 Run `contextd config` in a terminal to open the configuration TUI, styled like
-`explore`. Switch between **Speech to text** and **Cleanup / processing** with
-Tab or the left/right arrows, move with the up/down arrows, and press Enter to
-select a model. Each model shows whether it is cached locally. Missing models
-download with a live percentage and byte-count progress bar before the new
-selection is saved. Selecting a cleanup model also enables cleanup.
+`explore`. Use **1 Speech**, **2 Cleanup**, **3 All settings**, and **4 Microphones**,
+or switch sections with Tab/arrows. Press Enter to select a model or edit any config
+value. Settings open selectable value lists with descriptions: languages, engines,
+On/Off choices, short-transcript policies, and numeric presets. Model fields open
+the model browser; either microphone field opens the available-input toggle list.
+Each model shows its cache state. Selections save
+first, then missing weights download in the background. Selecting a cleanup model enables cleanup.
 
 Press `c` to toggle cleanup, `a` to toggle audio retention, and `q` or Escape to
-exit. Leaving during a download cancels it without changing the saved selection;
-retrying restarts the download. Settings changes require capture to be stopped.
+exit. Leaving Config with `q` keeps downloads running on the dashboard. Settings
+changes require capture to be stopped. The screen reloads external file edits every
+second while no value is being edited; invalid edits show an error and retain the active settings.
+Use arrows or `j`/`k` to browse choices, Enter to apply, and Esc to cancel.
+Choose **Custom value…** only for paths, sources, uncommon language codes, or numeric
+values outside the presets. `Ctrl+u` clears custom entry; Esc returns to choices.
+Empty optional paths/sources clear to `null`. Microphones need no JSON entry:
+toggle available inputs with Enter/Space, or choose System default to clear them.
+
+Press `r` to apply device/language suggestions and queue their downloads. Use
+`contextd recommend` to inspect the detected CPU, RAM, architecture, and suggestions
+without changing settings. These are lightweight choices, not guaranteed accuracy winners.
 
 Use `contextd config --json` to print settings explicitly. Redirected or piped
 `contextd config` also prints JSON, keeping existing scripts compatible.
@@ -42,13 +54,22 @@ Export the complete configuration before editing: omitted fields receive default
 | Field | Default | Meaning |
 |---|---|---|
 | `microphone` | `null` | Use the default input; otherwise an exact ID from `contextd microphones`. |
+| `microphones` | `[]` | Simultaneous input IDs; a nonempty list takes precedence over legacy `microphone`. Each input has its own segmentation state and transcripts include its source. |
 | `speech_model` | `parakeet-unified-en-0.6b` | Selected speech model. Use `contextd models` to list available IDs. |
 | `filter_enabled` | `false` | Run cleanup after transcription. First-run TUI setup offers to enable it. |
-| `filter_model` | `hf.co/superwhisper/s1-mini-GGUF:Q4_K_M` | S1-mini, `qwen2.5-1.5b-instruct`, `qwen2.5-3b-instruct`, or `llama3.2-3b-instruct`. |
-| `language` | `auto` | Whisper language detection or a language code such as `en`. Parakeet uses English. |
+| `filter_model` | `hf.co/superwhisper/s1-mini-GGUF:Q4_K_M` | S1-mini, `qwen3-4b-instruct-2507`, `qwen2.5-1.5b-instruct`, `qwen2.5-3b-instruct`, or `llama3.2-3b-instruct`. |
+| `language` | `auto` | Whisper language detection, a language code such as `en` or `hi`, or the `hi-en` mixed-language preset. Parakeet supports only `auto`/`en`. |
+| `preferred_language` | `auto` | Recognition hint and model-suggestion input (`en`, `hi`, `hi-en`, or another supported code); explicit `language` overrides it. |
+| `cleanup_backend` | `auto` | Infer backend from model ID, or explicitly select `gguf` / `mlx`. MLX requires Apple Silicon macOS. |
+| `cleanup_source` | `null` | Custom absolute GGUF file or HTTPS download URL; with MLX, an absolute model folder or Hugging Face repository ID. |
+| `mlx_python` | `null` | Optional Python executable with `mlx-lm` installed. Otherwise `uv` creates a cached Python 3.12 environment on first MLX use. |
+| `data_directory` | `null` | Absolute notes/audio/database directory override, applied after restart. Existing archives are not moved. |
+| `cache_directory` | `null` | Absolute cache override, applied after restart. Existing weights are not moved. |
+| `logs_directory` | `null` | Absolute logs override, applied after restart. Config remains at its original location. |
 | `short_transcript_policy` | `cleanup` | Discard empty cleanup output; `skip_all` also skips every 1–3-word transcript, `keep` disables this check. |
 | `retain_audio` | `false` | Keep completed WAV clips in `audio/`. |
 | `speech_threshold` | `0.012` | RMS energy threshold, allowed range `0.001`–`0.2`. Lower it for quieter speech. |
+| `vad_threshold` | `0.6` | Embedded Silero speech-confidence threshold (`0.1`–`0.95`), in addition to minimum RMS. Sustained speech onset is required; loud noise alone is insufficient. |
 | `silence_ms` | `1400` | Pause that ends a segment, allowed range `300`–`5000` ms. |
 | `max_segment_seconds` (legacy) | Ignored | Old configurations may contain this field. Continuous sound now ends only at a pause or when recording stops. |
 | `idle_unload_seconds` | `120` | Release idle models; `0` keeps them loaded, maximum `86400`. |
@@ -63,6 +84,10 @@ contextd --no-retain-audio
 ```
 
 Choose a microphone with `m` in TUI Setup, or set `microphone` in JSON.
+For multiple inputs, open Config → Microphones and toggle each input with Enter/Space.
+Selecting System default clears explicit selections. Independent inputs are not mixed,
+so overlapping devices can produce duplicate transcripts of the same speech. Live multi-input
+validation on the development host is blocked by its macOS microphone permission.
 
 ```sh
 # Several models download concurrently; --select keeps the last one
@@ -75,14 +100,50 @@ Model IDs come from `contextd models`. Disabling retention does not remove previ
 | Model | Download (Q4_K_M) | Purpose |
 |---|---:|---|
 | S1-mini by Superwhisper | 484 MB | Specialized English transcript normalization; recommended default. |
+| Qwen 3 4B Instruct 2507 | 2,497 MB | Non-thinking multilingual cleanup candidate for Hindi + English. |
+| Qwen 3.5 0.8B GGUF | 533 MB | Lightweight multilingual cleanup; 9/13 English and 5/10 mixed strict fixtures in the initial run, below 4B. |
+| Qwen 3.5 0.8B MLX | ~653 MB | Apple Silicon 4-bit alternative (`qwen3.5:0.8b-mlx`); 8/13 English + 5/10 mixed strict passes; requires Python/MLX runtime. |
 | Qwen 2.5 1.5B Instruct | 1,117 MB | Lightweight multilingual, prompt-based cleanup. |
 | Qwen 2.5 3B Instruct | 2,105 MB | Larger multilingual, prompt-based cleanup. |
 | Llama 3.2 3B Instruct | 2,019 MB | Alternative multilingual instruction model from Meta. |
 
-All run locally through embedded llama.cpp. Each model has its own cache file and
-generation protocol. General-purpose models have not yet been benchmarked against
-S1-mini in this runtime. Superwhisper also offers cloud GPT, Claude, Gemini, and
+GGUF models run locally through embedded llama.cpp; MLX uses a persistent local Python worker.
+Each model has its own cache file/folder and
+generation protocol. The comparison scripts test both English and mixed-language
+fixtures; see [Hindi + English evaluation](HINDI_ENGLISH_EVALUATION.md). Superwhisper also offers cloud GPT, Claude, Gemini, and
 Llama models; those hosted services are not part of this local catalog.
+
+### Hindi + English
+
+Press `v` in Setup or Config to cycle **auto → English → Hindi → Hindi + English**.
+Hindi presets replace English-only Parakeet or lightweight Whisper selections with
+Whisper Large-v3, and replace English-only S1-mini with lightweight Qwen3.5 0.8B.
+Other selected multilingual models are retained. Setup downloads the selected weights
+when saved; in Config, select each missing model with Enter to start its download.
+
+`hi` gives Whisper a Hindi source-language hint. `hi-en` detects the source language
+first, keeping English-only utterances working, and retries with a Hindi hint if
+Whisper detects a language outside Hindi/English (for example Urdu). Neither mode
+requests translation. Larger Whisper models are candidates for higher recognition
+accuracy; full `whisper-large-v3` (~3,095 MB) is also available in the catalog.
+
+Additional speech choices are `qwen3-asr-0.6b` (offline, 30 languages including Hindi),
+`nemotron-3.5-asr-streaming-0.6b` (multilingual, cache-aware streaming), and
+`whisper-small-q8_0` (~264 MB multilingual Whisper Small). Preferred language is a hint,
+not a promise of better accuracy: forcing Hindi on English clips can hurt recognition.
+Nemotron receives `hi-IN` / `en-US` hints, and automatic mode leaves its prompt unset.
+The `hi-en` preset preserves unrestricted Hindi/English detection initially.
+
+Multilingual cleanup is instructed to preserve Devanagari Hindi and English words without translating
+or transliterating them. S1-mini rejects Hindi-containing text before loading, and
+cleanup that removes all Devanagari text is rejected. During transcription these
+failures keep the original text and record `filter_error` rather than discarding it.
+Large output expansions (such as answering a dictated question) are also rejected.
+General chat models receive bilingual editing examples and quoted transcript data;
+S1-mini keeps its specialized upstream format. Supported model selections persist
+across restarts instead of being migrated back to S1-mini.
+The checks cannot detect every meaning change; raw and cleaned transcripts remain
+available together for review.
 
 ## Default directories
 

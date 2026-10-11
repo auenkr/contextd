@@ -2,10 +2,12 @@ pub mod audio;
 pub mod config;
 pub mod content;
 pub mod context;
+pub mod device;
 pub mod explore;
 pub mod history;
 pub mod inference;
 pub mod logging;
+mod mlx;
 pub mod models;
 mod queue;
 
@@ -70,9 +72,10 @@ pub struct Service {
 }
 impl Service {
     pub fn new() -> Result<Arc<Self>> {
-        let paths = Paths::discover()?;
+        let mut paths = Paths::discover()?;
         let settings = paths.load()?;
         settings.validate()?;
+        paths.apply_storage(&settings)?;
         history::History::open(&paths)?;
         let (events, _) = broadcast::channel(256);
         let service = Arc::new(Self {
@@ -108,6 +111,23 @@ impl Service {
     pub fn settings(&self) -> Settings {
         self.settings.lock().unwrap().clone()
     }
+    pub async fn refresh_settings(&self) -> Result<()> {
+        let settings = self.paths.load()?;
+        settings.validate()?;
+        if serde_json::to_value(&settings)? != serde_json::to_value(self.settings())? {
+            let session = self.session.lock().await;
+            if session.is_some() {
+                bail!("Pause capture before reloading settings");
+            }
+            models::speech_path(&self.paths, &settings.speech_model)?;
+            models::cleanup_location(&self.paths, &settings)?;
+            self.engine.lock().unwrap().unload();
+            let cleanup_engine = self.cleanup_engine.clone();
+            tokio::task::spawn_blocking(move || cleanup_engine.lock().unwrap().unload()).await?;
+            *self.settings.lock().unwrap() = settings;
+        }
+        Ok(())
+    }
     pub async fn save_settings(&self, settings: Settings) -> Result<()> {
         let session = self.session.lock().await;
         if session.is_some() {
@@ -122,10 +142,14 @@ impl Service {
             )
         })?;
         models::speech_path(&self.paths, &settings.speech_model)?;
-        models::cleanup_path(&self.paths, &settings.filter_model)?;
+        models::cleanup_location(&self.paths, &settings)?;
         self.paths.save(&settings)?;
         let old = self.settings();
-        if old.filter_model != settings.filter_model {
+        if old.filter_model != settings.filter_model
+            || old.cleanup_source != settings.cleanup_source
+            || old.cleanup_backend != settings.cleanup_backend
+            || old.mlx_python != settings.mlx_python
+        {
             let cleanup_engine = self.cleanup_engine.clone();
             tokio::task::spawn_blocking(move || cleanup_engine.lock().unwrap().unload()).await?;
         }
@@ -156,6 +180,7 @@ impl Service {
             raw: text.into(),
             refined: text.into(),
             speech_model: "manual-note".into(),
+            microphone: None,
             filter_model: None,
             duration_seconds: 0.0,
             audio_path: None,
@@ -254,10 +279,19 @@ impl Service {
         let engine = self.engine.clone();
         let opts = settings.clone();
         let (raw, samples) = tokio::task::spawn_blocking(move || {
+            if !audio::has_speech(&samples, &opts)? {
+                return anyhow::Ok((None, samples));
+            }
             let raw = engine.lock().unwrap().transcribe(&samples, &opts)?;
-            anyhow::Ok((raw, samples))
+            anyhow::Ok((Some(raw), samples))
         })
         .await??;
+        let Some(raw) = raw else {
+            self.activity(format!(
+                "Segment {id}: no voice detected; transcription skipped"
+            ));
+            return Ok(None);
+        };
         if raw.is_empty() {
             self.activity(format!(
                 "Segment {id}: no speech text recognized; no note saved"
@@ -310,6 +344,7 @@ impl Service {
             refined,
             raw,
             speech_model: settings.speech_model.clone(),
+            microphone: settings.microphone.clone(),
             filter_model: settings
                 .filter_enabled
                 .then_some(settings.filter_model.clone()),
@@ -363,12 +398,32 @@ impl Service {
         }
         // Only one process may own microphone capture for this data directory.
         let recording_lock = self.capture_lock()?;
+        let inputs = settings.selected_microphones();
+        let mut segmenters = inputs
+            .iter()
+            .map(|_| audio::Segmenter::new(settings.clone()))
+            .collect::<Result<Vec<_>>>()?;
         let (audio_tx, mut audio_rx) = mpsc::channel(256);
         let (err_tx, mut err_rx) = mpsc::unbounded_channel();
-        let mut capture = audio::Capture::start(settings.microphone.clone(), audio_tx, err_tx)?;
+        let mut captures = Vec::new();
+        for (source, microphone) in inputs.iter().enumerate() {
+            captures.push(audio::Capture::start_tagged(
+                microphone.clone(),
+                source,
+                audio_tx.clone(),
+                err_tx.clone(),
+            )?);
+        }
+        drop(audio_tx);
+        let descriptions: Vec<_> = captures
+            .iter()
+            .map(|capture| capture.description.clone())
+            .collect();
         self.activity(format!(
-            "Microphone started: {}. Speech threshold: {:.4}",
-            capture.description, settings.speech_threshold
+            "Microphone started: {}. Silero speech confidence: {:.2}; minimum RMS: {:.4}",
+            descriptions.join(" + "),
+            settings.vad_threshold,
+            settings.speech_threshold
         ));
         self.activity(format!(
             "Activity logs: {}; saved-text logs: {}",
@@ -421,7 +476,6 @@ impl Service {
                     }
                 }
             });
-            let mut segmenter = audio::Segmenter::new(settings.clone());
             let mut last_level = std::time::Instant::now();
             let mut input_samples = 0usize;
             let mut peak_level = 0.0f32;
@@ -435,7 +489,7 @@ impl Service {
                 tokio::select! {
                     _ = &mut stopped => break,
                     _ = heartbeat.tick() => {
-                        service.activity(format!("Microphone input: {:.1}s received in the last 10s; peak RMS {:.6e}, speech threshold {:.6e}; {}", input_samples as f64 / 16000.0, peak_level, settings.speech_threshold, if segmenter.is_active() { "capturing speech" } else { "waiting for speech" }));
+                        service.activity(format!("Microphone input: {:.1}s received from {} inputs in the last 10s; peak RMS {:.6e}, minimum RMS {:.6e}; voice confidence {:.2}, VAD threshold {:.2}; {}", input_samples as f64 / 16000.0, segmenters.len(), peak_level, settings.speech_threshold, segmenters.iter().map(|s| s.last_speech_probability()).fold(0.0f32, f32::max), settings.vad_threshold, if segmenters.iter().any(|s| s.is_active()) { "capturing speech" } else { "waiting for speech" }));
                         if input_samples == 0 || peak_level == 0.0 {
                             if !input_issue_reported {
                                 service.activity(if input_samples == 0 {
@@ -453,7 +507,13 @@ impl Service {
                     },
                     Some(message) = err_rx.recv() => { let _ = service.events.send(Event::Error { message }); },
                     samples = audio_rx.recv() => {
-                        let Some(samples) = samples else { break };
+                        let Some(input) = samples else { break };
+                        let source = input.source;
+                        let samples = input.samples;
+                        let segmenter = &mut segmenters[source];
+                        let mut source_settings = settings.clone();
+                        source_settings.microphone = Some(inputs[source].clone().unwrap_or_else(|| descriptions[source].clone()));
+                        source_settings.microphones.clear();
                         input_samples += samples.len();
                         peak_level = peak_level.max(audio::rms(&samples));
                         if last_level.elapsed().as_millis() >= 100 {
@@ -461,22 +521,66 @@ impl Service {
                             last_level = std::time::Instant::now();
                         }
                         let was_active = segmenter.is_active();
-                        if let Some(segment) = segmenter.push(&samples) {
-                            service.enqueue(segment, &settings, &segments_tx);
-                        } else if !was_active && segmenter.is_active() {
-                            service.activity("Speech detected; collecting audio until a pause");
+                        match segmenter.push(&samples) {
+                            Ok(segments) => {
+                                if !was_active && segmenter.is_active() {
+                                    service.activity(format!("Speech detected on {}; collecting audio until a pause", descriptions[source]));
+                                }
+                                for segment in segments {
+                                    service.enqueue(segment, &source_settings, &segments_tx);
+                                }
+                            }
+                            Err(error) => {
+                                let _ = service.events.send(Event::Error { message: format!("Speech detection failed: {error:#}") });
+                                break;
+                            }
                         }
                     }
                 }
             }
-            capture.stop();
-            while let Ok(samples) = audio_rx.try_recv() {
-                if let Some(segment) = segmenter.push(&samples) {
-                    service.enqueue(segment, &settings, &segments_tx);
+            for capture in &mut captures {
+                capture.stop();
+            }
+            while let Ok(input) = audio_rx.try_recv() {
+                let segmenter = &mut segmenters[input.source];
+                let mut source_settings = settings.clone();
+                source_settings.microphone = Some(
+                    inputs[input.source]
+                        .clone()
+                        .unwrap_or_else(|| descriptions[input.source].clone()),
+                );
+                source_settings.microphones.clear();
+                match segmenter.push(&input.samples) {
+                    Ok(segments) => {
+                        for segment in segments {
+                            service.enqueue(segment, &source_settings, &segments_tx);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = service.events.send(Event::Error {
+                            message: format!("Speech detection failed: {error:#}"),
+                        });
+                        break;
+                    }
                 }
             }
-            if let Some(segment) = segmenter.flush() {
-                service.enqueue(segment, &settings, &segments_tx);
+            for (source, segmenter) in segmenters.iter_mut().enumerate() {
+                let mut source_settings = settings.clone();
+                source_settings.microphone = Some(
+                    inputs[source]
+                        .clone()
+                        .unwrap_or_else(|| descriptions[source].clone()),
+                );
+                source_settings.microphones.clear();
+                match segmenter.flush() {
+                    Ok(Some(segment)) => service.enqueue(segment, &source_settings, &segments_tx),
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = service.events.send(Event::Error {
+                            message: format!("Speech detection failed: {error:#}"),
+                        });
+                    }
+                }
             }
             drop(segments_tx);
             let _ = worker.await;
