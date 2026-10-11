@@ -306,8 +306,8 @@ impl Service {
         }
         if settings.filter_enabled {
             self.activity(format!(
-                "Segment {id}: cleaning up transcript with {}",
-                settings.filter_model
+                "Segment {id}: cleaning up transcript with {} (saved text language: {})",
+                settings.filter_model, settings.output_language
             ));
         }
         let refined = self.refine(&raw, settings.clone()).await;
@@ -398,7 +398,7 @@ impl Service {
         }
         // Only one process may own microphone capture for this data directory.
         let recording_lock = self.capture_lock()?;
-        let inputs = settings.selected_microphones();
+        let mut inputs = settings.selected_microphones();
         let mut segmenters = inputs
             .iter()
             .map(|_| audio::Segmenter::new(settings.clone()))
@@ -414,13 +414,23 @@ impl Service {
                 err_tx.clone(),
             )?);
         }
+        if settings.record_device_audio {
+            let source = inputs.len();
+            captures.push(audio::Capture::start_device_output(
+                source,
+                audio_tx.clone(),
+                err_tx.clone(),
+            )?);
+            inputs.push(Some("Device audio · system output".into()));
+            segmenters.push(audio::Segmenter::new(settings.clone())?);
+        }
         drop(audio_tx);
         let descriptions: Vec<_> = captures
             .iter()
             .map(|capture| capture.description.clone())
             .collect();
         self.activity(format!(
-            "Microphone started: {}. Silero speech confidence: {:.2}; minimum RMS: {:.4}",
+            "Audio capture started: {}. Silero speech confidence: {:.2}; minimum RMS: {:.4}",
             descriptions.join(" + "),
             settings.vad_threshold,
             settings.speech_threshold
@@ -489,7 +499,7 @@ impl Service {
                 tokio::select! {
                     _ = &mut stopped => break,
                     _ = heartbeat.tick() => {
-                        service.activity(format!("Microphone input: {:.1}s received from {} inputs in the last 10s; peak RMS {:.6e}, minimum RMS {:.6e}; voice confidence {:.2}, VAD threshold {:.2}; {}", input_samples as f64 / 16000.0, segmenters.len(), peak_level, settings.speech_threshold, segmenters.iter().map(|s| s.last_speech_probability()).fold(0.0f32, f32::max), settings.vad_threshold, if segmenters.iter().any(|s| s.is_active()) { "capturing speech" } else { "waiting for speech" }));
+                        service.activity(format!("Audio input: {:.1}s received from {} inputs in the last 10s; peak RMS {:.6e}, minimum RMS {:.6e}; voice confidence {:.2}, VAD threshold {:.2}; {}", input_samples as f64 / 16000.0, segmenters.len(), peak_level, settings.speech_threshold, segmenters.iter().map(|s| s.last_speech_probability()).fold(0.0f32, f32::max), settings.vad_threshold, if segmenters.iter().any(|s| s.is_active()) { "capturing speech" } else { "waiting for speech" }));
                         if input_samples == 0 || peak_level == 0.0 {
                             if !input_issue_reported {
                                 service.activity(if input_samples == 0 {

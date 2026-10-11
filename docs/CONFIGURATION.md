@@ -30,7 +30,14 @@ second while no value is being edited; invalid edits show an error and retain th
 Use arrows or `j`/`k` to browse choices, Enter to apply, and Esc to cancel.
 Choose **Custom value…** only for paths, sources, uncommon language codes, or numeric
 values outside the presets. `Ctrl+u` clears custom entry; Esc returns to choices.
-Empty optional paths/sources clear to `null`. Microphones need no JSON entry:
+The All settings list uses a fixed order: speech model and audio inputs, recognition
+languages, cleanup and saved language, editing and audio retention, segmentation,
+then engines, custom sources and storage. It never reorders based on usage.
+Inherited paths show the effective data/cache/log folders; the cleanup source shows
+the selected model's actual location. Default microphones show their device names,
+and MLX Python shows the managed executable or that GGUF does not use Python.
+JSON keeps `null` for an inherited override; the interactive screen shows what it
+resolves to. Empty optional paths/sources clear the override. Microphones need no JSON entry:
 toggle available inputs with Enter/Space, or choose System default to clear them.
 
 Press `r` to apply device/language suggestions and queue their downloads. Use
@@ -60,6 +67,9 @@ Export the complete configuration before editing: omitted fields receive default
 | `filter_model` | `hf.co/superwhisper/s1-mini-GGUF:Q4_K_M` | S1-mini, `qwen3-4b-instruct-2507`, `qwen2.5-1.5b-instruct`, `qwen2.5-3b-instruct`, or `llama3.2-3b-instruct`. |
 | `language` | `auto` | Whisper language detection, a language code such as `en` or `hi`, or the `hi-en` mixed-language preset. Parakeet supports only `auto`/`en`. |
 | `preferred_language` | `auto` | Recognition hint and model-suggestion input (`en`, `hi`, `hi-en`, or another supported code); explicit `language` overrides it. |
+| `editor_mode` | `normal` | Individual note editing: `normal` for arrows and direct typing; `vim` for modal editing and basic motions. |
+| `record_device_audio` | `false` | Capture macOS system output alongside microphone inputs as an independent transcription source. Requires macOS 13+ and system audio recording permission. |
+| `output_language` | `same` | Saved text language: preserve spoken languages, or translate with cleanup into `en`, `hi`, `fr`, another listed code, or a model-supported language name. Requires cleanup enabled. |
 | `cleanup_backend` | `auto` | Infer backend from model ID, or explicitly select `gguf` / `mlx`. MLX requires Apple Silicon macOS. |
 | `cleanup_source` | `null` | Custom absolute GGUF file or HTTPS download URL; with MLX, an absolute model folder or Hugging Face repository ID. |
 | `mlx_python` | `null` | Optional Python executable with `mlx-lm` installed. Otherwise `uv` creates a cached Python 3.12 environment on first MLX use. |
@@ -118,10 +128,12 @@ Llama models; those hosted services are not part of this local catalog.
 Press `v` in Setup or Config to cycle **auto → English → Hindi → Hindi + English**.
 Hindi presets replace English-only Parakeet or lightweight Whisper selections with
 Whisper Large-v3, and replace English-only S1-mini with lightweight Qwen3.5 0.8B.
-Other selected multilingual models are retained. Setup downloads the selected weights
+Selected Qwen3 ASR and larger Whisper models are retained. Setup downloads the selected weights
 when saved; in Config, select each missing model with Enter to start its download.
+Selecting Hindi + English while using Nemotron switches to Qwen3 ASR 0.6B;
+this also applies when editing the language or preferred-language setting.
 
-`hi` gives Whisper a Hindi source-language hint. `hi-en` detects the source language
+`hi` gives a Hindi source-language hint. With Whisper, `hi-en` detects the source language
 first, keeping English-only utterances working, and retries with a Hindi hint if
 Whisper detects a language outside Hindi/English (for example Urdu). Neither mode
 requests translation. Larger Whisper models are candidates for higher recognition
@@ -132,7 +144,11 @@ Additional speech choices are `qwen3-asr-0.6b` (offline, 30 languages including 
 `whisper-small-q8_0` (~264 MB multilingual Whisper Small). Preferred language is a hint,
 not a promise of better accuracy: forcing Hindi on English clips can hurt recognition.
 Nemotron receives `hi-IN` / `en-US` hints, and automatic mode leaves its prompt unset.
-The `hi-en` preset preserves unrestricted Hindi/English detection initially.
+Nemotron's `hi-en` decoding initially leaves its prompt unset. With Qwen3 ASR,
+`hi-en` supplies a Hindi hint: automatic detection can otherwise romanize Hindi
+when an utterance ends in English. This hint preserves Devanagari Hindi and Latin
+English on the local mixed recording and its English-only excerpt; it does not
+request translation. Recognition can still miss individual words.
 
 Multilingual cleanup is instructed to preserve Devanagari Hindi and English words without translating
 or transliterating them. S1-mini rejects Hindi-containing text before loading, and
@@ -144,6 +160,90 @@ S1-mini keeps its specialized upstream format. Supported model selections persis
 across restarts instead of being migrated back to S1-mini.
 The checks cannot detect every meaning change; raw and cleaned transcripts remain
 available together for review.
+
+### Saved text language and translation
+
+Open **Config → All settings → Saved text language**. **Same as spoken** is the
+default: cleanup preserves each spoken language, including Hindi/English mixtures.
+Choosing **English**, **Hindi**, **French**, or another target enables cleanup and
+translates saved text into that language. Recognition settings still control what
+the speech model hears; they do not change with the output language.
+
+The picker offers common language codes and **Other supported language…** for a
+language name such as `Swahili`. Coverage depends on the cleanup model, not the
+speech model. Llama offers its eight officially supported languages; Qwen offers
+common multilingual targets plus custom names. [Qwen3.5's model card](https://huggingface.co/Qwen/Qwen3.5-0.8B),
+[Qwen2.5's model card](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct), and
+[Llama's model card](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct)
+describe their language coverage. Small models can mistranslate details even in
+supported languages; a capability class is not an accuracy guarantee.
+
+| Cleanup model class | Models | Saved-language behavior |
+|---|---|---|
+| Supports translation | Qwen GGUF/MLX and Llama 3.2 cleanup models | Target language picker is available. |
+| Does not support translation | S1-mini, including its aliases | Only Same as spoken is available. Config and the dashboard explicitly say the model does not support translation, so translation will not work. |
+
+`contextd models` exposes `translation_support: "supported"` or `"unsupported"`
+for catalog cleanup models. Speech models and custom cleanup sources have `null`:
+this classification concerns the cleanup step, and custom model capabilities are
+not inferred from their filename. For custom sources, choose only languages the
+model supports. Unsupported catalog model/target combinations fail validation,
+including when settings are loaded from JSON. Supported models show no
+unsupported-translation warning.
+
+For JSON configuration, set `filter_enabled: true`, select a multilingual
+`filter_model`, and set `output_language: "en"` for English. Use `"same"` to stop
+translating. Disabling cleanup also disables translation, while keeping the target
+setting for later use. Existing settings without this field default to `"same"`.
+
+The same setting applies to recordings, imported WAVs, and `contextd refine`.
+It persists with queued segments. Manual `contextd note` entries are saved as typed.
+Daily Markdown, search, and export use the cleaned/translated saved text; the
+original remains alongside it in history and in Markdown when wording differs.
+No existing entries are retranslated. GGUF, MLX, and custom chat-template cleanup
+use the same translation instructions. A detected cleanup/translation failure
+preserves the original and records `filter_error` rather than losing speech.
+
+## Device output audio
+
+Open **Config → All settings → Record device audio → On**. The JSON key is
+`record_device_audio`, default `false`; older configurations stay microphone-only.
+It takes effect when recording starts again. System output and each microphone
+have independent resamplers, voice detection and queued segments. Saved notes
+identify system output as **Device audio · system output**. Translation, cleanup,
+audio retention and language settings apply to all sources.
+
+This implementation uses macOS 13+ ScreenCaptureKit. Enable the terminal hosting
+contextd in **System Settings → Privacy & Security → Screen & System Audio
+Recording** when macOS requests it. Permission/startup failures are visible;
+recording does not silently start with a missing requested source. No screen video
+is saved. Other platforms report an unsupported-platform error when enabled.
+Capture follows system output before routing to speakers, wired headphones or
+Bluetooth headphones; no virtual audio device or speaker-to-microphone pickup is
+needed. Audio played by contextd itself is excluded. Speakers picked up by a microphone
+can still produce a second transcript; headphones avoid that overlap.
+
+## Read and edit individual notes
+
+Open **Explore notes**, select a date and press Enter, or click the date. Focus
+moves to the preview. Use arrows or `j/k`, the mouse wheel, Page Up/Down and `g/G`
+to scroll. Tab moves focus between the date list and preview; `1/2` changes the
+Notes/Audio tab. The preview groups each saved note by time with clear spacing,
+source labels and a scrollbar. `n/p` selects the next/previous note; `o` reveals
+original transcripts.
+
+Press **e** or Enter while focused on a note to edit that individual saved text.
+**Normal** controls let you type immediately and move with arrows, including
+wrapped lines. **Vim** controls start in navigation mode: `h/j/k/l`, `w/b`, `0/$`,
+`gg/G`; `i/a/A/o` enters insertion, and Esc returns to navigation. **Ctrl+s** saves
+and closes in either mode; Vim also supports `:w` and `:wq`. Esc in Normal, or
+Esc/`q`/`:q!` in Vim navigation, discards the draft. Set controls under **Config →
+All settings → Notes editor controls** (`editor_mode`).
+
+Saving updates the note, daily Markdown and search index. The original transcript,
+audio and model provenance remain intact. New recordings do not overwrite these
+edits. If another editor changes or deletes the same note, saving fails with a
+visible message and keeps your draft. Recording continues while Explore is open.
 
 ## Default directories
 
@@ -183,7 +283,7 @@ Retained audio adds its saved path. Errors remain visible. `--verbose` shows mic
 
 `processing.jsonl` contains completion records, including both texts, timestamps, IDs, saved paths, and cleanup failures. `activity.jsonl` retains microphone and processing diagnostics even without `--verbose`. Both append across runs. Console logs go to stderr; JSON command output goes to stdout.
 
-Daily Markdown is generated from SQLite history. Use `contextd note 'your text'` to add notes; hand edits to generated daily files can be overwritten. Temporary queued audio is deleted after successful processing, including when retention is disabled. Completed pending jobs survive interruptions, while an unfinished in-memory segment can be lost after abrupt termination.
+Daily Markdown is generated from SQLite history. Use `contextd note 'your text'` to add notes and Explore to edit individual saved notes. External hand edits to generated daily files can still be overwritten. Temporary queued audio is deleted after successful processing, including when retention is disabled. Completed pending jobs survive interruptions, while an unfinished in-memory segment can be lost after abrupt termination.
 
 ## Skip brief filler
 

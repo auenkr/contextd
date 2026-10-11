@@ -158,20 +158,36 @@ tail -f "$HOME/.local/state/contextd/processing.jsonl"
 
 Completion logs are written by `contextd-core`, so future interfaces receive the same logging behavior. Console logs use stderr to keep JSON command output on stdout usable by scripts.
 
+Device output audio is available alongside microphones on macOS 13+. Enable
+**Config → All settings → Record device audio** (`record_device_audio: true`).
+It defaults to **off**. System output is transcribed independently and saved with
+its own source label; allow Screen & System Audio Recording for your terminal.
+
 ## Explore saved files
 
-`contextd explore` (or `--explore`) opens a terminal file browser with **Notes** and **Audio** tabs. Notes show a scrollable Markdown text preview; retained WAV clips play through the default audio output inside the CLI. No external player is needed.
+`contextd explore` (or `--explore`) opens a terminal file browser with **Notes** and **Audio** tabs. Notes show a styled, scrollable preview grouped by recording time; retained WAV clips play through the default audio output inside the CLI. No external player is needed.
 
 | Key | Action |
 |---|---|
-| Tab, Left, Right | Switch between notes and audio |
-| Up/Down or k/j | Select a file |
-| Page Up/Page Down, Home/End | Scroll the preview |
+| 1 / 2 | Switch Notes / Audio |
+| Tab / Shift+Tab | Focus date list / preview |
+| Enter / click a date | Focus its preview |
+| Up/Down or k/j, mouse wheel | Select dates or scroll focused preview |
+| Page Up/Page Down, Home/End, g/G | Scroll the preview |
+| n / p | Select the next / previous note |
+| e / Enter in notes preview | Edit the individual saved note |
+| Ctrl+s | Save edits; preserve the original transcript |
+| o | Show / hide originals |
 | Enter on audio | Play the selected clip from the beginning |
-| Space | Pause or resume playback |
-| s | Stop playback |
+| Space, s | Pause/resume, stop playback |
 | r | Refresh files immediately |
-| q, Esc, Ctrl+C | Exit |
+| q, Esc | Return to dates, then exit |
+| Ctrl+C | Exit; inside the editor, discard draft |
+
+Choose **Normal** or **Vim** under Config → All settings → Notes editor controls.
+Normal uses arrows and direct typing. Vim supports `h/j/k/l`, `w/b`, `gg/G`,
+`i/a/A/o`, Esc, `:w` and `:wq`. Edits update search and daily Markdown while
+preserving the original transcript and surviving later recordings.
 
 The browser refreshes every two seconds and uses the same data directory as recording, including `--data-dir` or `CONTEXTD_HOME`. Run it in a second terminal while continuous recording stays active. Explore does not start capture, download models, or run the setup guide. Audio appears only when retention was enabled while recording (`--retain-audio`); discarded clips cannot be played. File listing and note access are exposed by `contextd_core::explore` for reuse by future interfaces; terminal rendering and playback controls belong to the CLI.
 
@@ -195,8 +211,9 @@ Download and select a speech model with `contextd download <model-id> --select`.
 
 For **Hindi + English**, press `v` in Setup or Config until the language is `hi-en`.
 The preset upgrades lightweight/English-only speech selections to Whisper Large-v3 and
-replaces S1-mini with lightweight multilingual Qwen3.5 0.8B. Mixed mode keeps English
-utterances working and retries Hindi when detection confuses it with another language.
+replaces S1-mini with lightweight multilingual Qwen3.5 0.8B. When Nemotron is selected,
+the mixed preset switches to Qwen3 ASR with a Hindi hint to preserve Devanagari and
+English script together. Whisper keeps automatic detection with a Hindi retry.
 See [configuration](docs/CONFIGURATION.md#hindi--english) and the
 [real-model comparison](docs/HINDI_ENGLISH_EVALUATION.md) for outputs and measured errors.
 
@@ -205,6 +222,17 @@ See [configuration](docs/CONFIGURATION.md#hindi--english) and the
 The CLI downloads the selected cleanup GGUF into the app's `models/` directory and runs it inside the application using the embedded `llama.cpp` runtime. No model server is required.
 
 Default: **"S1-mini" by "Superwhisper"**, downloaded as `s1-mini-q4_k_m.gguf`. This model is fine-tuned specifically for speech-transcript normalization: fillers, repeated words, abandoned starts, explicit self-corrections, punctuation, and spoken numbers. It is English-only.
+
+Config → **All settings → Saved text language** controls translation after recognition.
+The default is **Same as spoken** (`output_language: "same"`). Choose **English**
+(`"en"`), Hindi, French, or another supported target to clean up and translate saved
+notes while retaining the original transcript. Selecting a target enables cleanup.
+Cleanup models are classified as **supports translation** or **does not support translation**;
+the class appears in Config and in `contextd models` JSON as `translation_support`.
+S1-mini does not translate: selecting it shows an explicit warning and restricts
+saved text to Same as spoken. Qwen and Llama cleanup models support translation,
+with language coverage and accuracy depending on the selected model. Custom
+models have unclassified capabilities; choose only languages they support.
 
 ```sh
 contextd download hf.co/superwhisper/s1-mini-GGUF:Q4_K_M --select

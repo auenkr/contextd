@@ -8,6 +8,7 @@ use contextd_core::{
 use std::io::{self, IsTerminal, Write};
 mod configure;
 mod downloads;
+mod editor;
 mod explore;
 mod home;
 mod tui;

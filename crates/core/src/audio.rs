@@ -150,6 +150,111 @@ impl Capture {
             }
         }
     }
+    /// Device output is independent of microphone streams and uses its own resampler.
+    #[cfg(target_os = "macos")]
+    pub fn start_device_output(
+        source: usize,
+        sender: mpsc::Sender<InputAudio>,
+        errors: mpsc::UnboundedSender<String>,
+    ) -> Result<Self> {
+        use screencapturekit::{prelude::*, stream::delegate_trait::ErrorHandler};
+        use std::sync::Mutex;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let thread = thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let content = SCShareableContent::get().context(
+                    "Device audio requires macOS 13+ and Screen & System Audio Recording permission. Enable your terminal under System Settings > Privacy & Security > Screen & System Audio Recording, then restart recording",
+                )?;
+                let display = content
+                    .displays()
+                    .into_iter()
+                    .next()
+                    .context("No display available for device audio capture")?;
+                let filter = SCContentFilter::create()
+                    .with_display(&display)
+                    .with_excluding_windows(&[])
+                    .build()?;
+                let config = SCStreamConfiguration::new()
+                    .with_width(2)
+                    .with_height(2)
+                    .with_captures_audio(true)
+                    .with_sample_rate(48_000)
+                    .with_channel_count(2)
+                    .with_excludes_current_process_audio(true);
+                let delegate_errors = errors.clone();
+                let delegate = ErrorHandler::new(move |error| {
+                    let _ = delegate_errors.send(format!("Device audio stopped: {error}. Restart recording after restoring Screen & System Audio Recording access."));
+                });
+                let mut stream = SCStream::new_with_delegate(&filter, &config, delegate)?;
+                let resampler = Mutex::new(Resampler::new(48_000));
+                let reported_error = AtomicBool::new(false);
+                let callback_errors = errors.clone();
+                // Register audio only: no screen frames are delivered or saved.
+                stream.add_output_handler(move |sample: CMSampleBuffer, _: SCStreamOutputType| {
+                    let result = (|| -> Result<()> {
+                        let format = sample.format_description().context("Missing device audio format")?;
+                        if format.audio_sample_rate() != Some(48_000.0)
+                            || !format.audio_is_float() || format.audio_bits_per_channel() != Some(32)
+                            || format.audio_is_big_endian() {
+                            bail!("Unsupported device audio format; expected 48 kHz little-endian float32");
+                        }
+                        let buffers = sample.audio_buffer_list().map_err(|code| anyhow::anyhow!("Cannot read device audio buffer: {code}"))?;
+                        let channels: Vec<_> = (0..buffers.num_buffers()).filter_map(|i| buffers.get(i))
+                            .map(|buffer| (buffer.number_channels as usize, buffer.data())).collect();
+                        let mono = output_mono(&channels)?;
+                        let samples = resampler.lock().map_err(|_| anyhow::anyhow!("Device audio resampler lock failed"))?.push(&mono);
+                        if !samples.is_empty() && sender.try_send(InputAudio {source, samples}).is_err() {
+                            bail!("Device audio callback overflow; input audio was dropped");
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        if !reported_error.swap(true, Ordering::Relaxed) {
+                            let _ = callback_errors.send(error.to_string());
+                        }
+                    }
+                }, SCStreamOutputType::Audio)?;
+                stream.start_capture().context("Could not start device audio; check Screen & System Audio Recording access for your terminal")?;
+                let _ = ready_tx.send(Ok(
+                    "Device audio · system output (48000 Hz, 2 channels)".to_string()
+                ));
+                while !flag.load(Ordering::Relaxed) {
+                    thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if let Err(error) = stream.stop_capture() {
+                    let _ = errors.send(format!("Stopping device audio: {error}"));
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                let _ = ready_tx.send(Err(format!("{error:#}")));
+            }
+        });
+        match ready_rx.recv()? {
+            Ok(description) => Ok(Self {
+                description,
+                stop,
+                thread: Some(thread),
+            }),
+            Err(error) => {
+                let _ = thread.join();
+                bail!("{error}")
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn start_device_output(
+        _source: usize,
+        _sender: mpsc::Sender<InputAudio>,
+        _errors: mpsc::UnboundedSender<String>,
+    ) -> Result<Self> {
+        bail!("Device audio capture is supported on macOS 13+; turn off record_device_audio on this platform");
+    }
+
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
@@ -161,6 +266,36 @@ impl Drop for Capture {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Downmix planar or interleaved float32 CoreMedia buffers without alignment casts.
+#[cfg(any(target_os = "macos", test))]
+fn output_mono(buffers: &[(usize, &[u8])]) -> Result<Vec<f32>> {
+    let channels: usize = buffers.iter().map(|(channels, _)| channels).sum();
+    if channels == 0 {
+        bail!("Device audio contains no channels");
+    }
+    let mut mono: Option<Vec<f32>> = None;
+    for &(count, bytes) in buffers {
+        if count == 0 || bytes.len() % (count * 4) != 0 {
+            bail!("Malformed device audio buffer");
+        }
+        let frames = bytes.len() / (count * 4);
+        let output = mono.get_or_insert_with(|| vec![0.0; frames]);
+        if output.len() != frames {
+            bail!("Device audio channel lengths differ");
+        }
+        for (frame, target) in bytes.chunks_exact(count * 4).zip(output.iter_mut()) {
+            for value in frame.as_chunks::<4>().0 {
+                let value = f32::from_le_bytes(*value);
+                if !value.is_finite() {
+                    bail!("Device audio contains a non-finite sample");
+                }
+                *target += value / channels as f32;
+            }
+        }
+    }
+    Ok(mono.unwrap_or_default())
 }
 
 #[cfg(target_os = "macos")]
@@ -490,6 +625,101 @@ pub fn read_wav(path: &std::path::Path) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "plays generated speech and requires macOS system audio recording access"]
+    fn live_device_output_delivers_tagged_speech() {
+        let directory = tempfile::tempdir().unwrap();
+        let speech = directory.path().join("device-test.aiff");
+        assert!(std::process::Command::new("say")
+            .arg("-o")
+            .arg(&speech)
+            .arg("This is a device audio capture test. The meeting is tomorrow morning.")
+            .status()
+            .unwrap()
+            .success());
+        let (sender, mut receiver) = mpsc::channel(256);
+        let (errors, mut error_rx) = mpsc::unbounded_channel();
+        let mut capture = Capture::start_device_output(7, sender, errors).unwrap();
+        let mut player = std::process::Command::new("afplay")
+            .arg(&speech)
+            .spawn()
+            .unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (samples, peak) = runtime.block_on(async {
+            let deadline = tokio::time::sleep(std::time::Duration::from_secs(8));
+            tokio::pin!(deadline);
+            let mut samples = Vec::new(); let mut peak = 0.0f32;
+            loop { tokio::select! {
+                _ = &mut deadline => break,
+                Some(audio) = receiver.recv() => {
+                    assert_eq!(audio.source, 7); peak = peak.max(rms(&audio.samples)); samples.extend(audio.samples);
+                }
+            }}
+            (samples, peak)
+        });
+        let _ = player.wait();
+        capture.stop();
+        assert!(
+            error_rx.try_recv().is_err(),
+            "device audio reported an error"
+        );
+        assert!(
+            samples.len() > 16_000 && peak > 0.001,
+            "No audible device output: {} samples, peak RMS {peak}",
+            samples.len()
+        );
+        assert!(has_speech(&samples, &Settings::default()).unwrap());
+        println!(
+            "Device output: {} tagged 16 kHz samples, peak RMS {peak:.4}",
+            samples.len()
+        );
+        if let Some(cache) = std::env::var_os("CONTEXTD_TEST_MODEL_CACHE") {
+            use crate::inference::SpeechToText;
+            let mut paths = crate::Paths::in_directory(directory.path());
+            paths.cache_dir = cache.into();
+            let mut engine = crate::inference::LocalSpeechEngine::new(paths);
+            let settings = Settings {
+                speech_model: std::env::var("CONTEXTD_TEST_SPEECH_MODEL")
+                    .unwrap_or_else(|_| Settings::default().speech_model),
+                language: "en".into(),
+                ..Settings::default()
+            };
+            let transcript = engine.transcribe(&samples, &settings).unwrap();
+            let lower = transcript.to_lowercase();
+            assert!(
+                lower.contains("meeting") && lower.contains("tomorrow"),
+                "{transcript}"
+            );
+            println!("Device output transcript: {transcript}");
+        }
+    }
+
+    #[test]
+    fn device_audio_downmix_accepts_planar_and_interleaved_stereo() {
+        let left: Vec<u8> = [1.0f32, 0.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let right: Vec<u8> = [-1.0f32, 0.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let packed: Vec<u8> = [1.0f32, -1.0, 0.0, 0.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert_eq!(
+            output_mono(&[(1, &left), (1, &right)]).unwrap(),
+            vec![0.0, 0.25]
+        );
+        assert_eq!(output_mono(&[(2, &packed)]).unwrap(), vec![0.0, 0.25]);
+        assert!(output_mono(&[(0, &left)]).is_err());
+        assert!(output_mono(&[(2, &packed[..3])]).is_err());
+        assert!(output_mono(&[(1, &left), (1, &right[..4])]).is_err());
+        assert!(output_mono(&[(1, &f32::NAN.to_le_bytes())]).is_err());
+    }
+
     #[test]
     fn resampling_is_independent_of_callback_boundaries() {
         let input: Vec<_> = (0..44100).map(|i| (i as f32 * 0.03).sin()).collect();

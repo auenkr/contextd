@@ -2,7 +2,7 @@ use crate::tui::{panel, ACCENT, BACKGROUND, MUTED, SELECTED};
 use crate::{downloads::Downloads, tui};
 use anyhow::{bail, Result};
 use contextd_core::{
-    audio, config::CleanupBackend, device::DeviceProfile, models, Service, Settings,
+    audio, config::CleanupBackend, device::DeviceProfile, models, Paths, Service, Settings,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -32,13 +32,154 @@ struct Choice {
     value: Option<String>,
 }
 
+// Deliberately fixed: common recording choices first, advanced storage last.
+const SETTINGS_ORDER: &[&str] = &[
+    "speech_model",
+    "microphones",
+    "microphone",
+    "record_device_audio",
+    "preferred_language",
+    "language",
+    "filter_enabled",
+    "filter_model",
+    "output_language",
+    "editor_mode",
+    "retain_audio",
+    "silence_ms",
+    "short_transcript_policy",
+    "speech_threshold",
+    "vad_threshold",
+    "idle_unload_seconds",
+    "cleanup_backend",
+    "cleanup_source",
+    "cache_directory",
+    "data_directory",
+    "logs_directory",
+    "mlx_python",
+];
+
+fn setting_value(
+    key: &str,
+    value: &serde_json::Value,
+    settings: &Settings,
+    paths: &Paths,
+    microphones: &[audio::Microphone],
+) -> String {
+    let default_microphone = || {
+        microphones
+            .iter()
+            .find(|m| m.is_default)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| "System default (no input connected)".into())
+    };
+    match key {
+        "data_directory" => settings
+            .data_directory
+            .as_ref()
+            .unwrap_or(&paths.root)
+            .display()
+            .to_string(),
+        "cache_directory" => settings
+            .cache_directory
+            .as_ref()
+            .unwrap_or(&paths.cache_dir)
+            .display()
+            .to_string(),
+        "logs_directory" => settings
+            .logs_directory
+            .as_ref()
+            .unwrap_or(&paths.logs_dir)
+            .display()
+            .to_string(),
+        "cleanup_source" => settings.cleanup_source.clone().unwrap_or_else(|| {
+            models::cleanup_location(paths, settings)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|e| e.to_string())
+        }),
+        "mlx_python" => settings
+            .mlx_python
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| {
+                if settings.uses_mlx() {
+                    paths
+                        .cache_dir
+                        .join("mlx-runtime/venv/bin/python")
+                        .display()
+                        .to_string()
+                } else {
+                    "Not used by the GGUF engine".into()
+                }
+            }),
+        "microphone" => settings
+            .microphone
+            .as_ref()
+            .map(|id| {
+                microphones
+                    .iter()
+                    .find(|m| &m.id == id)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| id.clone())
+            })
+            .unwrap_or_else(default_microphone),
+        "microphones" => {
+            if settings.microphones.is_empty() {
+                format!(
+                    "Primary input: {}",
+                    setting_value(
+                        "microphone",
+                        &serde_json::Value::Null,
+                        settings,
+                        paths,
+                        microphones
+                    )
+                )
+            } else {
+                settings
+                    .microphones
+                    .iter()
+                    .map(|id| {
+                        microphones
+                            .iter()
+                            .find(|m| &m.id == id)
+                            .map(|m| m.name.as_str())
+                            .unwrap_or(id)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            }
+        }
+        "cleanup_backend" => format!(
+            "{}{}",
+            if settings.uses_mlx() { "MLX" } else { "GGUF" },
+            if settings.cleanup_backend == CleanupBackend::Auto {
+                " (automatic)"
+            } else {
+                ""
+            }
+        ),
+        "output_language" => models::output_language_name(&settings.output_language).to_string(),
+        _ if value.is_f64() => format!("{:.6}", value.as_f64().unwrap())
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string(),
+        _ => value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string()),
+    }
+}
+
 fn setting_info(key: &str) -> (&str, &str) {
     match key {
         "preferred_language" => ("Preferred language", "Guide automatic recognition and model recommendations. Choosing a preference resets the explicit language override to auto."),
-        "language" => ("Language override", "Auto follows your preferred language. An explicit language overrides it. Hindi + English starts with automatic detection, then retries Hindi when needed."),
+        "language" => ("Language override", "Auto follows your preferred language. An explicit language overrides it. Hindi + English uses model-specific recognition hints to preserve both languages."),
+        "output_language" => ("Saved text language", "Same as spoken preserves the original languages. Other choices enable cleanup and translate the saved text; originals remain available. Choose a multilingual cleanup model for translation. Custom targets depend on that model's language support."),
+        "editor_mode" => ("Notes editor controls", "Normal: arrows move and typing edits immediately. Vim: h/j/k/l move, i/a/o enter insert mode, Esc returns to navigation. Ctrl+s saves in either mode. Originals remain intact."),
         "cleanup_backend" => ("Cleanup engine", "Auto chooses the engine from the model. GGUF runs locally through llama.cpp. MLX requires Apple Silicon macOS. Changing this can select a compatible cleanup model."),
         "short_transcript_policy" => ("Short transcripts", "Decide what to do with very short speech: preserve it, clean it, or discard it."),
         "filter_enabled" => ("Transcript cleanup", "Remove fillers and repetitions after recognition. Original transcripts are preserved; cleanup needs a downloaded model."),
+        "record_device_audio" => ("Record device audio", "Off by default. On captures system output alongside microphone inputs as a separate source. Supported on macOS 13+; allow Screen & System Audio Recording for your terminal. No screen video is saved. Applies when recording restarts."),
         "retain_audio" => ("Keep audio recordings", "Off saves text without retaining completed audio recordings. On keeps recordings alongside transcripts and uses more disk space."),
         "silence_ms" => ("Pause before saving", "How much silence ends a speech segment. Allowed: 300–5000 ms. Shorter pauses save sooner; longer pauses keep thoughts together."),
         "speech_threshold" => ("Minimum voice volume", "Minimum RMS energy before speech can start. Allowed: 0.001–0.2. Lower values help quiet voices; higher values reject low-level noise."),
@@ -59,6 +200,10 @@ fn setting_info(key: &str) -> (&str, &str) {
 
 fn setting_choices(key: &str) -> Vec<Choice> {
     let presets: Vec<(&str, &str, &str)> = match key {
+        "editor_mode" => vec![
+            ("normal", "Normal", "Arrow keys and direct typing"),
+            ("vim", "Vim", "Normal/insert modes with basic Vim motions"),
+        ],
         "language" | "preferred_language" => vec![
             ("auto", "Automatic", "Detect language / follow preference"),
             ("en", "English", "English speech"),
@@ -79,7 +224,7 @@ fn setting_choices(key: &str) -> Vec<Choice> {
             ),
             ("skip_all", "Skip all", "Discard all short transcripts"),
         ],
-        "filter_enabled" | "retain_audio" => {
+        "filter_enabled" | "retain_audio" | "record_device_audio" => {
             vec![("false", "Off", "Disabled"), ("true", "On", "Enabled")]
         }
         "silence_ms" => vec![
@@ -123,7 +268,12 @@ fn setting_choices(key: &str) -> Vec<Choice> {
         .collect();
     if !matches!(
         key,
-        "cleanup_backend" | "short_transcript_policy" | "filter_enabled" | "retain_audio"
+        "cleanup_backend"
+            | "short_transcript_policy"
+            | "filter_enabled"
+            | "retain_audio"
+            | "record_device_audio"
+            | "editor_mode"
     ) {
         choices.push(Choice {
             label: "Custom value…".into(),
@@ -135,8 +285,38 @@ fn setting_choices(key: &str) -> Vec<Choice> {
 }
 
 impl Editing {
-    fn new(key: &str, value: &serde_json::Value) -> Self {
-        let mut choices = setting_choices(key);
+    fn new(key: &str, value: &serde_json::Value, settings: &Settings) -> Self {
+        let mut choices = if key == "output_language" {
+            let mut choices = vec![Choice {
+                label: "Same as spoken (default)".into(),
+                description: "Keep the spoken languages; no translation".into(),
+                value: Some("same".into()),
+            }];
+            choices.extend(
+                models::OUTPUT_LANGUAGES
+                    .iter()
+                    .filter(|(code, _)| models::supports_output_language(settings, code))
+                    .map(|(code, name)| Choice {
+                        label: (*name).into(),
+                        description: format!("Clean up and translate saved text into {name}"),
+                        value: Some((*code).into()),
+                    }),
+            );
+            if settings.cleanup_source.is_some()
+                || models::cleanup_translation_support(&settings.filter_model)
+                    != Some(models::TranslationSupport::Unsupported)
+                    && settings.filter_model != "llama3.2-3b-instruct"
+            {
+                choices.push(Choice {
+                    label: "Other supported language…".into(),
+                    description: "Enter a language name supported by your cleanup model".into(),
+                    value: None,
+                });
+            }
+            choices
+        } else {
+            setting_choices(key)
+        };
         let value = value
             .as_str()
             .map(str::to_owned)
@@ -198,6 +378,9 @@ fn apply_edit(
     };
     settings = serde_json::from_value(document)?;
     match key {
+        "output_language" if settings.output_language != "same" => {
+            settings.filter_enabled = true;
+        }
         "preferred_language" | "language" => {
             if key == "preferred_language" {
                 settings.language = "auto".into();
@@ -207,6 +390,10 @@ fn apply_edit(
                 && settings.speech_language() != "auto"
             {
                 settings.speech_model = device.recommend(&settings).speech_model;
+            } else if settings.speech_language() == "hi-en"
+                && settings.speech_model.starts_with("nemotron-3.5")
+            {
+                settings.speech_model = "qwen3-asr-0.6b".into();
             }
         }
         "cleanup_backend" if settings.cleanup_source.is_none() => {
@@ -270,11 +457,9 @@ pub fn run(
         let settings = service.settings();
         let recommendation = device.recommend(&settings);
         let document = serde_json::to_value(&settings)?;
-        let fields: Vec<_> = document
-            .as_object()
-            .unwrap()
+        let fields: Vec<_> = SETTINGS_ORDER
             .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
+            .map(|key| ((*key).to_string(), document[*key].clone()))
             .collect();
         let mut microphones = audio::microphones().unwrap_or_default();
         for id in settings.selected_microphones().into_iter().flatten() {
@@ -298,10 +483,11 @@ pub fn run(
         let selected = selection.selected().unwrap_or(0).min(count - 1);
         selection.select(Some(selected));
         let active = downloads.snapshot();
+        let translation_warning = models::translation_warning(&settings);
         terminal.draw(|frame| {
             let rows = Layout::vertical([
                 Constraint::Length(1), Constraint::Length(3), Constraint::Min(5),
-                  Constraint::Length(4), Constraint::Length(if active.is_empty() { 0 } else { 6 }), Constraint::Length(3), Constraint::Length(2),
+                  Constraint::Length(if translation_warning.is_some() { 6 } else { 4 }), Constraint::Length(if active.is_empty() { 0 } else { 6 }), Constraint::Length(3), Constraint::Length(2),
             ]).split(frame.area());
              frame.render_widget(Block::default().style(Style::default().bg(BACKGROUND)), frame.area());
              frame.render_widget(Paragraph::new(Line::from(vec![
@@ -338,23 +524,28 @@ pub fn run(
                  .highlight_style(Style::default().bg(SELECTED).fg(Color::White))
                  .block(panel(" Models · j / k ")), columns[0], &mut selection);
             let model = &catalog[selected];
-             frame.render_widget(Paragraph::new(format!("{}\n\n{}\n\nApproximate download: {} MB\nCache: {}\n\nDevice: {}\n\nEnter: select/download · r: recommended models\nd: delete the cached copy", model.name, model.description, model.size_mb,
+            let translation_class = match model.translation_support {
+                Some(models::TranslationSupport::Supported) => "\n\nModel class: supports translation".to_string(),
+                Some(models::TranslationSupport::Unsupported) => format!("\n\nModel class: does not support translation\n{} does not support translation, so translation will not work.", model.name),
+                None => String::new(),
+            };
+             frame.render_widget(Paragraph::new(format!("{}\n\n{}{}\n\nApproximate download: {} MB\nCache: {}\n\nDevice: {}\n\nEnter: select/download · r: recommended models\nd: delete the cached copy", model.name, model.description, translation_class, model.size_mb,
                  service.paths.models_dir().display(), recommendation.reason))
                   .wrap(Wrap { trim: false }).block(panel(" Model details ")), columns[1]);
             } else if tab == 2 {
                  let items: Vec<_> = fields.iter().map(|(key,value)| ListItem::new(Line::from(vec![
                      Span::styled(format!("{}  ", setting_info(key).0), Style::default().fg(Color::White)),
-                     Span::styled(value.to_string(), Style::default().fg(if value == &serde_json::Value::Bool(true) { Color::Green } else { ACCENT })),
+                     Span::styled(setting_value(key, value, &settings, &service.paths, &microphones), Style::default().fg(if value == &serde_json::Value::Bool(true) { Color::Green } else { ACCENT })),
                  ]))).collect();
                  frame.render_stateful_widget(List::new(items).highlight_symbol("› ").highlight_style(Style::default().bg(SELECTED).add_modifier(Modifier::BOLD)).block(panel(" Every config value · Enter: choose ")), columns[0], &mut selection);
                 let (key,value) = &fields[selected];
                  let (label, description) = setting_info(key);
-                 let choices = setting_choices(key);
+                     let choices = Editing::new(key, value, &settings).choices;
                  let mut details = vec![
                      Line::styled(label.to_string(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
                      Line::styled(key.to_string(), Style::default().fg(MUTED)),
                      Line::from(""), Line::from(description.to_string()), Line::from(""),
-                     Line::from(vec![Span::raw("Current: "), Span::styled(value.to_string(), Style::default().fg(Color::Yellow))]),
+                     Line::from(vec![Span::raw("Current: "), Span::styled(setting_value(key, value, &settings, &service.paths, &microphones), Style::default().fg(Color::Yellow))]),
                      Line::from(""), tui::section("Possible values"),
                  ];
                  if matches!(key.as_str(), "speech_model" | "filter_model" | "microphone" | "microphones") {
@@ -371,8 +562,14 @@ pub fn run(
                  frame.render_stateful_widget(List::new(items).highlight_symbol("› ").highlight_style(Style::default().bg(SELECTED).fg(ACCENT)).block(panel(" Inputs · Enter / Space: toggle ")), columns[0], &mut selection);
                  frame.render_widget(Paragraph::new(format!("Select several inputs to record them simultaneously.\n\nEach input has its own resampler and speech detector. Audio is not interleaved or mixed; saved transcripts identify the source microphone.\n\nSelecting System default clears explicit selections. Disconnected selected inputs remain visible.\n\nSelected IDs: {:?}", settings.selected_microphones())).wrap(Wrap {trim:false}).block(panel(" Microphone recording ")), columns[1]);
             }
-             frame.render_widget(Paragraph::new(format!("Cleanup: {} (c: toggle) · Retain audio: {} (a: toggle)\nLanguage: {} (v: auto → English → Hindi → Hindi + English)",
-                 if settings.filter_enabled { "enabled" } else { "disabled" }, settings.retain_audio, settings.language))
+            let mut controls = vec![
+                Line::from(format!("Cleanup: {} (c: toggle) · Retain audio: {} (a: toggle) · Device audio: {}", if settings.filter_enabled { "enabled" } else { "disabled" }, settings.retain_audio, if settings.record_device_audio { "on" } else { "off" })),
+                Line::from(format!("Language: {} (v: auto → English → Hindi → Hindi + English) · Saved text: {}", settings.language, models::output_language_name(&settings.output_language))),
+            ];
+            if let Some(message) = &translation_warning {
+                controls.push(Line::styled(message.clone(), Style::default().fg(Color::Yellow)));
+            }
+             frame.render_widget(Paragraph::new(controls).wrap(Wrap { trim: false })
                  .style(Style::default().fg(ACCENT)).block(panel(" Quick controls ")), rows[3]);
             let progress = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(rows[4]);
             if let Some((id, first)) = active.first() {
@@ -597,7 +794,7 @@ pub fn run(
                         selection.select(Some(0));
                     }
                     _ => {
-                        editing = Some(Editing::new(key, value));
+                        editing = Some(Editing::new(key, value, &settings));
                         message = "Choose a value; Enter saves, Esc cancels.".into();
                     }
                 }
@@ -745,6 +942,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inherited_settings_show_effective_defaults() {
+        let settings = Settings::default();
+        let paths = Paths::in_directory("/example/contextd");
+        let microphones = vec![audio::Microphone {
+            id: "0:test".into(),
+            name: "Actual default microphone".into(),
+            is_default: true,
+        }];
+        for (key, expected) in [
+            ("cache_directory", "/example/contextd"),
+            ("data_directory", "/example/contextd"),
+            ("logs_directory", "/example/contextd/logs"),
+            ("microphone", "Actual default microphone"),
+            ("cleanup_backend", "GGUF (automatic)"),
+        ] {
+            assert_eq!(
+                setting_value(
+                    key,
+                    &serde_json::Value::Null,
+                    &settings,
+                    &paths,
+                    &microphones
+                ),
+                expected
+            );
+        }
+        assert!(setting_value(
+            "cleanup_source",
+            &serde_json::Value::Null,
+            &settings,
+            &paths,
+            &microphones
+        )
+        .ends_with("s1-mini-q4_k_m.gguf"));
+        assert!(!setting_value(
+            "mlx_python",
+            &serde_json::Value::Null,
+            &settings,
+            &paths,
+            &microphones
+        )
+        .contains("null"));
+        assert!(!settings.record_device_audio);
+        let mut enabled = settings.clone();
+        enabled.record_device_audio = true;
+        assert!(
+            serde_json::from_value::<Settings>(serde_json::to_value(enabled).unwrap())
+                .unwrap()
+                .record_device_audio
+        );
+    }
+
+    #[test]
     fn pickers_cover_enums_and_select_current_numeric_presets() {
         for (key, expected) in [
             ("cleanup_backend", vec!["auto", "gguf", "mlx"]),
@@ -764,19 +1014,49 @@ mod tests {
             );
         }
         let document = serde_json::to_value(Settings::default()).unwrap();
-        let editor = Editing::new("vad_threshold", &document["vad_threshold"]);
+        let editor = Editing::new(
+            "vad_threshold",
+            &document["vad_threshold"],
+            &Settings::default(),
+        );
         assert_eq!(editor.selection.selected(), Some(1));
         assert_eq!(editor.choices.len(), 4);
-        let editor = Editing::new("silence_ms", &serde_json::json!(1800));
+        let editor = Editing::new("silence_ms", &serde_json::json!(1800), &Settings::default());
         assert_eq!(editor.choices[0].value.as_deref(), Some("1800"));
         assert!(!editor.custom);
         assert!(editor.choices.last().unwrap().value.is_none());
     }
 
     #[test]
+    fn saved_language_picker_uses_the_selected_models_translation_class() {
+        let mut settings = Settings::default();
+        let value = serde_json::json!("same");
+        let editor = Editing::new("output_language", &value, &settings);
+        assert_eq!(editor.choices.len(), 1);
+        assert_eq!(editor.choices[0].value.as_deref(), Some("same"));
+        settings.filter_model = "qwen3.5:0.8b".into();
+        let editor = Editing::new("output_language", &value, &settings);
+        assert_eq!(editor.choices[1].value.as_deref(), Some("en"));
+        assert!(editor
+            .choices
+            .iter()
+            .any(|choice| choice.value.as_deref() == Some("hi")));
+        assert!(editor.choices.last().unwrap().value.is_none());
+        settings.filter_model = "llama3.2-3b-instruct".into();
+        let editor = Editing::new("output_language", &value, &settings);
+        assert_eq!(editor.choices.len(), 9);
+        assert!(!editor
+            .choices
+            .iter()
+            .any(|choice| choice.value.as_deref() == Some("ja")));
+    }
+
+    #[test]
     fn every_setting_has_a_specific_guide() {
         let document = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(SETTINGS_ORDER.len(), document.as_object().unwrap().len());
         for key in document.as_object().unwrap().keys() {
+            assert!(SETTINGS_ORDER.contains(&key.as_str()));
             assert_ne!(setting_info(key).0, key);
         }
     }
@@ -795,6 +1075,28 @@ mod tests {
             apply_edit(Settings::default(), "preferred_language", "hi-en", &device).unwrap();
         assert_eq!(settings.speech_model, "qwen3-asr-0.6b");
         assert_eq!(settings.speech_language(), "hi-en");
+        let multilingual = Settings {
+            filter_model: "qwen3.5:0.8b".into(),
+            ..Settings::default()
+        };
+        let translated = apply_edit(multilingual, "output_language", "en", &device).unwrap();
+        assert!(translated.filter_enabled);
+        assert_eq!(translated.output_language, "en");
+        assert!(
+            apply_edit(Settings::default(), "output_language", "en", &device)
+                .unwrap_err()
+                .to_string()
+                .contains("does not support translation")
+        );
+        for key in ["language", "preferred_language"] {
+            let nemotron = Settings {
+                speech_model: "nemotron-3.5-asr-streaming-0.6b".into(),
+                ..Settings::default()
+            };
+            let mixed = apply_edit(nemotron, key, "hi-en", &device).unwrap();
+            assert_eq!(mixed.speech_model, "qwen3-asr-0.6b");
+            assert_eq!(mixed.speech_language(), "hi-en");
+        }
         let settings = apply_edit(settings, "microphones", r#"["one","two"]"#, &device).unwrap();
         assert_eq!(settings.selected_microphones().len(), 2);
         let settings = apply_edit(settings, "cache_directory", "/absolute/cache", &device).unwrap();

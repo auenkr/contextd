@@ -324,8 +324,9 @@ pub fn run(
             ]
         };
         let action_count = actions.len().saturating_sub(1);
+        let translation_warning = models::translation_warning(&settings);
         terminal.draw(|frame| {
-            let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(8), Constraint::Length(3), Constraint::Length(1)]).split(frame.area());
+            let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(8), Constraint::Length(if translation_warning.is_some() { 7 } else { 4 }), Constraint::Length(1)]).split(frame.area());
             let state = if downloads.any_active() {
                 "Downloading models"
             } else if setup {
@@ -358,7 +359,12 @@ pub fn run(
                     })
                     .block(tui::panel(format!(" Downloading {id} "))), rows[2]);
             } else {
-                 frame.render_widget(Paragraph::new(if setup { format!("Language: {} · v: auto / English / Hindi / Hindi + English", settings.language) } else { format!("Models: {} · language {} · cleanup {}", settings.speech_model, settings.language, if settings.filter_enabled { settings.filter_model.as_str() } else { "disabled" }) }).block(tui::panel(" Local processing ")), rows[2]);
+                let mut processing_info = vec![Line::from(if setup { format!("Language: {} · v: auto / English / Hindi / Hindi + English", settings.language) } else { format!("Models: {} · language {} · cleanup {} · saved text {}", settings.speech_model, settings.language, if settings.filter_enabled { settings.filter_model.as_str() } else { "disabled" }, models::output_language_name(&settings.output_language)) })];
+                processing_info.push(Line::from(format!("Audio: {} microphone input(s) · device output {}", settings.selected_microphones().len(), if settings.record_device_audio { "on" } else { "off" })));
+                if let Some(message) = &translation_warning {
+                    processing_info.push(Line::styled(message.clone(), Style::default().fg(Color::Yellow)));
+                }
+                 frame.render_widget(Paragraph::new(processing_info).wrap(Wrap { trim: false }).block(tui::panel(" Local processing ")), rows[2]);
             }
             let hints: Vec<Span> = if downloads.any_active() {
                 vec![Span::raw("hjkl / arrows: navigate · "), Span::styled("?: help", Style::default().fg(Color::Yellow)), Span::raw(if setup && !first_run { " · Esc / Backspace: cancel and go back" } else { " · q: cancel and exit" })]

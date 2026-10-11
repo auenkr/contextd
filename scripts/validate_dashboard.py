@@ -28,6 +28,7 @@ class Terminal:
         )
         os.close(slave)
         self.output = bytearray()
+        self.columns = 150
 
     def drain(self, seconds=0.3):
         deadline = time.monotonic() + seconds
@@ -46,6 +47,14 @@ class Terminal:
 
     def keys(self, text):
         os.write(self.master, text.encode())
+        self.drain()
+
+    def redraw(self):
+        # Force a complete frame; ratatui's incremental character updates are
+        # not complete phrases in this script's raw ANSI capture.
+        self.columns = 149 if self.columns == 150 else 150
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, self.columns, 0, 0))
+        self.process.send_signal(signal.SIGWINCH)
         self.drain()
 
     def expect(self, word, timeout=10):
@@ -89,6 +98,7 @@ def main():
         terminal.expect("microphones")  # Help content from the shared overlay.
         terminal.keys("\x1b")  # Esc closes help without acting on the setup screen.
         terminal.keys("vvv")  # auto -> English -> Hindi -> Hindi + English
+        terminal.redraw()
         terminal.expect("hi-en")
         terminal.keys("f")
         terminal.expect("Qwen")
@@ -143,6 +153,10 @@ def main():
             [binary, "--data-dir", str(configured), "models"], text=True))
         filters = [model for model in models if model["kind"] == "filter"]
         assert len(filters) == 7
+        assert {model["id"]: model["translation_support"] for model in filters} == {
+            model["id"]: "unsupported" if model["id"].startswith("hf.co/superwhisper/") else "supported"
+            for model in filters
+        }
         for filename in ["s1-mini-q4_k_m.gguf", "qwen2.5-1.5b-instruct-q4_k_m.gguf",
                          "qwen2.5-3b-instruct-q4_k_m.gguf", "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
                           "Qwen3-4B-Instruct-2507-Q4_K_M.gguf", "Qwen3.5-0.8B-Q4_K_M.gguf"]:
@@ -194,14 +208,44 @@ def main():
         assert settings["speech_model"] == "whisper-large-v3"
         terminal.keys("3")
         terminal.expect("Every")
-        fields = sorted(settings)
+        fields = ["speech_model", "microphones", "microphone", "record_device_audio",
+                  "preferred_language", "language", "filter_enabled", "filter_model",
+                  "output_language", "editor_mode", "retain_audio", "silence_ms",
+                  "short_transcript_policy", "speech_threshold", "vad_threshold",
+                  "idle_unload_seconds", "cleanup_backend", "cleanup_source",
+                  "cache_directory", "data_directory", "logs_directory", "mlx_python"]
+        assert set(fields) == set(settings)
+        # Output translation uses a persistent picker and respects model support.
+        terminal.keys("g" + "j" * fields.index("output_language") + "\r")
+        terminal.expect("Same as spoken")
+        terminal.expect("English")
+        terminal.keys("gj\r")
+        saved = json.loads((configured / "settings.json").read_text())
+        assert saved["output_language"] == "en" and saved["filter_enabled"]
+        terminal.keys("\rg\r")  # Restore the default without changing recognition.
+        saved = json.loads((configured / "settings.json").read_text())
+        assert saved["output_language"] == "same"
+        saved["filter_model"] = "hf.co/superwhisper/s1-mini-GGUF:Q4_K_M"
+        (configured / "settings.json").write_text(json.dumps(saved))
+        terminal.drain(1.5)
+        terminal.expect("does not support translation")
+        saved["filter_model"] = settings["filter_model"]
+        (configured / "settings.json").write_text(json.dumps(saved))
+        terminal.drain(1.5)
         terminal.keys("g" + "j" * fields.index("preferred_language") + "\r")
         terminal.expect("Choose a value")
         terminal.expect("Hindi + English")
         terminal.keys("gjjj\r")
         settings = json.loads((configured / "settings.json").read_text())
-        assert settings["preferred_language"] == "hi-en"
+        assert settings["preferred_language"] == "hi-en", settings
         assert settings["language"] == "auto"
+        # System output is opt-in and uses an On/Off picker.
+        assert not settings["record_device_audio"]
+        terminal.keys("g" + "j" * fields.index("record_device_audio") + "\r")
+        terminal.keys("gj\r")
+        assert json.loads((configured / "settings.json").read_text())["record_device_audio"]
+        terminal.keys("\rg\r")
+        assert not json.loads((configured / "settings.json").read_text())["record_device_audio"]
         # Changes made outside the TUI appear without reopening it.
         settings["retain_audio"] = True
         (configured / "settings.json").write_text(json.dumps(settings))

@@ -1,5 +1,5 @@
 use crate::Paths;
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +77,59 @@ impl History {
             .prepare("SELECT document FROM transcripts ORDER BY created_at DESC")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+    pub fn for_day(&self, day: chrono::NaiveDate) -> Result<Vec<Transcript>> {
+        let lower = day.and_hms_opt(0, 0, 0).unwrap().and_utc() - chrono::Duration::days(1);
+        let upper = lower + chrono::Duration::days(3);
+        let mut statement = self.0.prepare(
+            "SELECT document FROM transcripts WHERE julianday(created_at) >= julianday(?1)
+             AND julianday(created_at) < julianday(?2) ORDER BY julianday(created_at) ASC",
+        )?;
+        let mut entries = Vec::new();
+        for row in statement.query_map(params![lower.to_rfc3339(), upper.to_rfc3339()], |row| {
+            row.get::<_, String>(0)
+        })? {
+            let entry: Transcript = serde_json::from_str(&row?)?;
+            if chrono::DateTime::parse_from_rfc3339(&entry.created_at)?
+                .with_timezone(&chrono::Local)
+                .date_naive()
+                == day
+            {
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Save user edits without replacing the original or a concurrent edit.
+    pub fn edit_saved_text(&self, id: &str, expected: &str, text: &str) -> Result<()> {
+        if text.trim().is_empty() {
+            bail!("A saved note cannot be empty");
+        }
+        let tx = self.0.unchecked_transaction()?;
+        let document: String = tx
+            .query_row(
+                "SELECT document FROM transcripts WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .context("This note was deleted; your edit has not been saved")?;
+        let mut entry: Transcript = serde_json::from_str(&document)?;
+        if entry.refined != expected {
+            bail!("This note changed since editing began; your draft is preserved. Cancel and reopen it before saving.");
+        }
+        entry.refined = text.to_owned();
+        tx.execute(
+            "UPDATE transcripts SET document = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(&entry)?],
+        )?;
+        tx.execute(
+            "UPDATE memory_fts SET text = ?2 WHERE id = ?1",
+            params![id, text],
+        )?;
+        tx.commit()?;
+        self.sync_day(&entry.created_at)
     }
     pub fn delete(&self, id: &str) -> Result<()> {
         let created_at: Option<String> = self
@@ -192,6 +245,55 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn individual_edits_preserve_originals_search_and_new_recordings() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_directory(dir.path().to_owned());
+        paths.ensure_dirs().unwrap();
+        let history = History::open(&paths).unwrap();
+        let mut entry = Transcript {
+            id: "first".into(),
+            created_at: chrono::Local::now().to_rfc3339(),
+            raw: "हिंदी and English original".into(),
+            refined: "Before editing".into(),
+            speech_model: "qwen3-asr-0.6b".into(),
+            filter_model: None,
+            duration_seconds: 5.0,
+            audio_path: Some("unchanged.wav".into()),
+            filter_error: None,
+            microphone: Some("Device audio · system output".into()),
+        };
+        history.insert(&entry).unwrap();
+        history
+            .edit_saved_text(&entry.id, &entry.refined, "User corrected tomorrow")
+            .unwrap();
+        assert!(history.search("editing", 10).unwrap().is_empty());
+        let edited = history.search("tomorrow", 10).unwrap().remove(0);
+        assert_eq!(edited.raw, entry.raw);
+        assert_eq!(edited.audio_path, entry.audio_path);
+        assert_eq!(edited.microphone, entry.microphone);
+        assert!(history
+            .edit_saved_text(&entry.id, "Before editing", "Stale draft")
+            .is_err());
+        assert!(history
+            .edit_saved_text(&entry.id, &edited.refined, "  ")
+            .is_err());
+        entry.id = "second".into();
+        entry.refined = "Next recording".into();
+        history.insert(&entry).unwrap();
+        let markdown =
+            std::fs::read_to_string(note_path(&paths, &entry.created_at).unwrap()).unwrap();
+        assert!(markdown.contains("User corrected tomorrow"));
+        assert!(markdown.contains("Next recording"));
+        assert!(markdown.contains("हिंदी and English original"));
+        let day = chrono::Local::now().date_naive();
+        assert_eq!(history.for_day(day).unwrap().len(), 2);
+        history.delete("first").unwrap();
+        assert!(history
+            .edit_saved_text("first", &edited.refined, "Deleted draft")
+            .is_err());
+    }
+
     #[test]
     fn daily_markdown_tracks_raw_cleanup_search_and_delete() {
         let dir = tempfile::tempdir().unwrap();

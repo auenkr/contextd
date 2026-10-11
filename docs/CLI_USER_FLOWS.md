@@ -62,7 +62,16 @@ contextd --explore
 contextd --data-dir "$HOME/contextd" explore
 ```
 
-**Checkpoint:** the terminal shows Notes and Audio tabs and refreshes every two seconds. Tab switches folders; arrows select files; Page Up/Page Down scroll the note preview. Enter on an audio file starts playback, Space pauses/resumes, and `s` stops it. `q`, Esc, or Ctrl+C closes the browser and restores the terminal. Recording in the other terminal continues. Empty folders show an explanation; audio is available only when it was retained. Explore works without speech models or setup and requires an interactive terminal.
+**Checkpoint:** the terminal shows Notes and Audio tabs and refreshes every two seconds. Use `1/2` to switch folders. Arrows select dates; Enter or a click focuses the preview, where arrows, `j/k`, the wheel and Page Up/Page Down scroll. Tab switches focus. `n/p` selects a note, `e` edits its saved text, and Ctrl+s saves without changing its original transcript. Config → Notes editor controls selects Normal or Vim. Enter on an audio file starts playback, Space pauses/resumes, and `s` stops it. `q`/Esc returns to the date list, then exits; Ctrl+C exits directly and restores the terminal. Recording in the other terminal continues. Empty folders show an explanation; audio is available only when it was retained. Explore works without speech models or setup and requires an interactive terminal.
+
+### Include device output
+
+Open Config → All settings → Record device audio and choose On, then return to
+recording. It defaults to Off. On macOS 13+, allow Screen & System Audio Recording
+for the terminal if requested. The dashboard lists both microphone and device
+output inputs; notes from output audio show their source. Cleanup and saved-language
+translation also apply to device audio. Disable the setting to resume microphone-only
+capture. A missing permission produces an actionable error.
 
 ## 4. Add and retrieve thoughts
 
@@ -122,6 +131,14 @@ contextd
 **Checkpoint:** original speech is saved before local cleanup. If the model is missing or cannot load, the original remains saved and an error is recorded. When wording changes, the original remains in Markdown too.
 
 The default is **"S1-mini" by "Superwhisper"**, a 0.6B model fine-tuned for this task, with English-only support. It runs in-process through the embedded GGUF runtime and uses its specialized non-thinking generation protocol. Pure-filler empty output is accepted. See [cleanup research](CLEANUP_MODEL_RESEARCH.md) for the broader comparison and limitations.
+
+To translate saved notes, choose a multilingual cleanup model, then open
+**Config → All settings → Saved text language** and select **English** or another
+supported target. **Same as spoken** is the default. Selecting a translation target
+enables cleanup; originals remain available. S1-mini is explicitly classified as
+not supporting translation, displays a warning, and offers only Same as spoken.
+Qwen and Llama are classified as supporting translation; their available languages
+and translation accuracy vary. See [saved text language](CONFIGURATION.md#saved-text-language-and-translation).
 
 ## 9. Resume after interruption
 

@@ -6,7 +6,8 @@ Install stable Rust and Cargo using [rustup](https://doc.rust-lang.org/book/ch01
 
 ### macOS
 
-Install Apple's command-line developer tools:
+macOS 13 or newer is required. Install Apple's command-line developer tools
+(including Swift, used by the system audio capture bridge):
 
 ```sh
 xcode-select --install
@@ -45,7 +46,7 @@ Cargo installs `contextd` into `$CARGO_HOME/bin`, normally `~/.cargo/bin`. Make 
 cargo build --release --locked -p contextd-cli
 ./target/release/contextd
 # Or build and run in one command:
-cargo run --release --locked -p contextd-cli -- start
+cargo run --release --locked -p contextd-cli
 ```
 
 ## Update or uninstall
@@ -65,7 +66,7 @@ Uninstalling the binary leaves your settings, notes, downloaded models, and logs
 
 ## Keep recording in tmux
 
-`start` runs in the foreground. To keep it running after detaching from a terminal:
+`contextd` runs in the foreground. To keep it running after detaching from a terminal:
 
 ```sh
 tmux new -s contextd

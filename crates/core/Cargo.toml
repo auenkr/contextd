@@ -17,6 +17,7 @@ directories = "6"
 rusqlite = { version = "0.37", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
+unicode-script = "0.5"
 futures-util = "0.3"
 hound = "3.5"
 axum = "0.8"
@@ -27,7 +28,11 @@ llama-cpp-2 = { version = "0.1.159", default-features = false, features = ["comm
 [dev-dependencies]
 tempfile = "3"
 
+[build-dependencies]
+serde_json.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = "11"
 objc2 = "0.6"
 block2 = "0.6"
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "block2"] }

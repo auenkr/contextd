@@ -55,7 +55,11 @@ mod tests {
                 samples: vec![0.1; 1600],
                 started_at,
             },
-            Settings::default(),
+            Settings {
+                output_language: "en".into(),
+                filter_model: "qwen3.5:0.8b".into(),
+                ..Settings::default()
+            },
         )
         .unwrap();
         assert_eq!(pending(&paths).unwrap(), vec![path.clone()]);
@@ -63,6 +67,7 @@ mod tests {
         assert_eq!(job.segment.started_at, started_at);
         assert_eq!(job.segment.samples.len(), 1600);
         assert_eq!(job.settings.speech_model, "parakeet-unified-en-0.6b");
+        assert_eq!(job.settings.output_language, "en");
         assert!(uuid::Uuid::parse_str(&job.id).is_ok());
         std::fs::remove_file(path).unwrap();
         assert!(pending(&paths).unwrap().is_empty());

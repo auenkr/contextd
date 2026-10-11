@@ -5,6 +5,92 @@ use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncWriteExt, sync::broadcast};
 
 pub const DEFAULT_FILTER_MODEL: &str = "hf.co/superwhisper/s1-mini-GGUF:Q4_K_M";
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranslationSupport {
+    Supported,
+    Unsupported,
+}
+
+pub fn cleanup_translation_support(id: &str) -> Option<TranslationSupport> {
+    cleanup_model(id)
+        .ok()
+        .map(|model| model.translation_support)
+}
+
+pub fn translation_warning(settings: &crate::Settings) -> Option<String> {
+    if settings.cleanup_source.is_none()
+        && cleanup_translation_support(&settings.filter_model)
+            == Some(TranslationSupport::Unsupported)
+    {
+        let name = cleanup_model(&settings.filter_model).ok()?.name;
+        Some(format!("{name} does not support translation, so translation will not work. Select a multilingual cleanup model."))
+    } else {
+        None
+    }
+}
+/// Common output targets. Other model-supported languages can be entered by name.
+pub const OUTPUT_LANGUAGES: &[(&str, &str)] = &[
+    ("en", "English"),
+    ("hi", "Hindi"),
+    ("es", "Spanish"),
+    ("fr", "French"),
+    ("de", "German"),
+    ("it", "Italian"),
+    ("pt", "Portuguese"),
+    ("zh", "Chinese"),
+    ("ja", "Japanese"),
+    ("ko", "Korean"),
+    ("ru", "Russian"),
+    ("ar", "Arabic"),
+    ("bn", "Bengali"),
+    ("ta", "Tamil"),
+    ("te", "Telugu"),
+    ("mr", "Marathi"),
+    ("gu", "Gujarati"),
+    ("kn", "Kannada"),
+    ("ml", "Malayalam"),
+    ("pa", "Punjabi"),
+    ("ur", "Urdu"),
+    ("th", "Thai"),
+    ("vi", "Vietnamese"),
+    ("id", "Indonesian"),
+    ("tr", "Turkish"),
+    ("nl", "Dutch"),
+    ("pl", "Polish"),
+    ("uk", "Ukrainian"),
+    ("fa", "Persian"),
+    ("he", "Hebrew"),
+];
+
+pub fn output_language_name(value: &str) -> &str {
+    if value == "same" {
+        return "Same as spoken";
+    }
+    OUTPUT_LANGUAGES
+        .iter()
+        .find(|(code, name)| code.eq_ignore_ascii_case(value) || name.eq_ignore_ascii_case(value))
+        .map(|(_, name)| *name)
+        .unwrap_or(value)
+}
+
+pub fn supports_output_language(settings: &crate::Settings, value: &str) -> bool {
+    if value == "same" || settings.cleanup_source.is_some() {
+        return true;
+    }
+    if cleanup_translation_support(&settings.filter_model) == Some(TranslationSupport::Unsupported)
+    {
+        return false; // Transcript normalization only, including for English targets.
+    }
+    if settings.filter_model == "llama3.2-3b-instruct" {
+        return ["en", "de", "fr", "it", "pt", "hi", "es", "th"]
+            .iter()
+            .any(|code| {
+                output_language_name(code).eq_ignore_ascii_case(output_language_name(value))
+            });
+    }
+    true // Qwen and custom models: further language coverage is model-dependent.
+}
 const CLEANUP_FILENAME: &str = "s1-mini-q4_k_m.gguf";
 const EXTRA_SPEECH_MODELS: &[(&str, &str, &str, &str, u64, &str)] = &[
     (
@@ -32,10 +118,12 @@ struct CleanupModel {
     filename: &'static str,
     size_mb: u64,
     description: &'static str,
+    translation_support: TranslationSupport,
 }
 
 const CLEANUP_MODELS: &[CleanupModel] = &[
     CleanupModel {
+        translation_support: TranslationSupport::Supported,
         id: "qwen3.5:0.8b-mlx",
         name: "Qwen 3.5 0.8B · MLX",
         repository: "mlx-community/Qwen3.5-0.8B-4bit",
@@ -44,6 +132,7 @@ const CLEANUP_MODELS: &[CleanupModel] = &[
         description: "Apple Silicon · 4-bit MLX · lightweight multilingual cleanup",
     },
     CleanupModel {
+        translation_support: TranslationSupport::Supported,
         id: "qwen3.5:0.8b",
         name: "Qwen 3.5 0.8B · GGUF",
         repository: "unsloth/Qwen3.5-0.8B-GGUF",
@@ -52,6 +141,7 @@ const CLEANUP_MODELS: &[CleanupModel] = &[
         description: "Lightweight multilingual cleanup · non-thinking · Q4_K_M",
     },
     CleanupModel {
+        translation_support: TranslationSupport::Unsupported,
         id: DEFAULT_FILTER_MODEL,
         name: "S1-mini by Superwhisper",
         repository: "superwhisper/s1-mini-GGUF",
@@ -60,6 +150,7 @@ const CLEANUP_MODELS: &[CleanupModel] = &[
         description: "Recommended · specialized English transcript cleanup · Q4_K_M",
     },
     CleanupModel {
+        translation_support: TranslationSupport::Supported,
         id: "qwen3-4b-instruct-2507",
         name: "Qwen 3 4B Instruct 2507",
         repository: "unsloth/Qwen3-4B-Instruct-2507-GGUF",
@@ -68,6 +159,7 @@ const CLEANUP_MODELS: &[CleanupModel] = &[
         description: "Hindi + English cleanup candidate · non-thinking · Q4_K_M",
     },
     CleanupModel {
+        translation_support: TranslationSupport::Supported,
         id: "qwen2.5-1.5b-instruct",
         name: "Qwen 2.5 1.5B Instruct",
         repository: "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
@@ -76,6 +168,7 @@ const CLEANUP_MODELS: &[CleanupModel] = &[
         description: "Lightweight multilingual instruction model · prompt-based cleanup · Q4_K_M",
     },
     CleanupModel {
+        translation_support: TranslationSupport::Supported,
         id: "qwen2.5-3b-instruct",
         name: "Qwen 2.5 3B Instruct",
         repository: "Qwen/Qwen2.5-3B-Instruct-GGUF",
@@ -84,6 +177,7 @@ const CLEANUP_MODELS: &[CleanupModel] = &[
         description: "Larger multilingual instruction model · prompt-based cleanup · Q4_K_M",
     },
     CleanupModel {
+        translation_support: TranslationSupport::Supported,
         id: "llama3.2-3b-instruct",
         name: "Llama 3.2 3B Instruct",
         repository: "bartowski/Llama-3.2-3B-Instruct-GGUF",
@@ -122,6 +216,9 @@ pub struct Model {
     pub size_mb: u64,
     pub description: String,
     pub installed: bool,
+    /// Cleanup translation class; absent for speech or unclassified custom models.
+    #[serde(default)]
+    pub translation_support: Option<TranslationSupport>,
 }
 
 pub fn catalog(paths: &Paths) -> Vec<Model> {
@@ -129,6 +226,7 @@ pub fn catalog(paths: &Paths) -> Vec<Model> {
         id: "parakeet-unified-en-0.6b".into(),
         name: "Parakeet Unified EN · 0.6B".into(),
         kind: "speech".into(),
+        translation_support: None,
         size_mb: 731,
         description: "Default · English · Q8_0 · fast local transcription".into(),
         installed: paths
@@ -143,6 +241,7 @@ pub fn catalog(paths: &Paths) -> Vec<Model> {
                 id: (*id).into(),
                 name: (*name).into(),
                 kind: "speech".into(),
+                translation_support: None,
                 size_mb: *size,
                 description: (*description).into(),
                 installed: paths.models_dir().join(filename).exists(),
@@ -190,6 +289,7 @@ pub fn catalog(paths: &Paths) -> Vec<Model> {
             id: format!("whisper-{id}"),
             name: name.into(),
             kind: "speech".into(),
+            translation_support: None,
             size_mb: size,
             description: desc.into(),
             installed: paths.models_dir().join(format!("ggml-{id}.bin")).exists(),
@@ -199,6 +299,7 @@ pub fn catalog(paths: &Paths) -> Vec<Model> {
         id: model.id.into(),
         name: model.name.into(),
         kind: "filter".into(),
+        translation_support: Some(model.translation_support),
         size_mb: model.size_mb,
         description: model.description.into(),
         installed: if model.id.ends_with("-mlx") {
@@ -218,6 +319,7 @@ pub fn catalog(paths: &Paths) -> Vec<Model> {
                 id: "custom".into(),
                 name: "Custom cleanup model".into(),
                 kind: "filter".into(),
+                translation_support: None,
                 size_mb: 0,
                 description: format!(
                     "{} · {}",
@@ -472,6 +574,37 @@ pub async fn download(paths: &Paths, id: &str, events: &broadcast::Sender<Event>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn translation_classes_and_warnings_match_cleanup_models_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths::in_directory(directory.path());
+        for model in catalog(&paths) {
+            if model.kind == "speech" {
+                assert_eq!(model.translation_support, None);
+                continue;
+            }
+            let unsupported = is_s1_model(&model.id);
+            assert_eq!(
+                model.translation_support,
+                Some(if unsupported {
+                    TranslationSupport::Unsupported
+                } else {
+                    TranslationSupport::Supported
+                })
+            );
+            let settings = crate::Settings {
+                filter_model: model.id,
+                ..Default::default()
+            };
+            assert_eq!(translation_warning(&settings).is_some(), unsupported);
+        }
+        let custom = crate::Settings {
+            cleanup_source: Some("/custom/model.gguf".into()),
+            ..Default::default()
+        };
+        assert!(translation_warning(&custom).is_none());
+    }
 
     #[test]
     fn delete_removes_only_the_requested_model() {
