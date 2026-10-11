@@ -113,10 +113,16 @@ impl Service {
         if session.is_some() {
             bail!("Stop listening before changing settings");
         }
+        // A recording session is already rejected above, so this lock is held by
+        // another process using the same data directory.
         let _capture_lock = self.capture_lock().map_err(|_| {
-            anyhow::anyhow!("Stop listening before changing settings; another process is recording")
+            anyhow::anyhow!(
+                "Another {} process is already listening in this data directory",
+                config::PRODUCT_NAME
+            )
         })?;
         models::speech_path(&self.paths, &settings.speech_model)?;
+        models::cleanup_path(&self.paths, &settings.filter_model)?;
         self.paths.save(&settings)?;
         let old = self.settings();
         if old.filter_model != settings.filter_model {

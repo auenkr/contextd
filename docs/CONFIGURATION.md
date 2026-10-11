@@ -1,16 +1,40 @@
 # Configuration and storage
 
-The first `contextd start` opens an interactive guide. It selects Parakeet or Whisper Base, offers English cleanup through S1-mini, and asks whether to keep audio. Settings persist; later starts reuse them.
+Run `contextd` to open the recording dashboard. On first run, setup appears inside the TUI: choose speech and cleanup models, audio retention, and microphone, then press Enter. Settings persist; later launches automatically download missing selected models and start recording. The left sidebar contains pause/resume, Config, Explore notes, Setup, and Back; live processing logs appear on the right.
+
+Both screens accept vi-style keys (`j`/`k` to move, `h`/`l` to change model or switch tabs, `g`/`G` for the first and last item) and `?` opens an on-screen help listing every binding. `Backspace` leaves Setup and returns to recording, discarding unsaved changes.
+
+Model downloads report their progress in four places: the bottom gauge with percentage and megabytes, one line per percent in the live log, a **Downloading models** status, and the model screen's own gauge with a queue list. A download never blocks the interface — the sidebar can still be browsed, `?` help still opens, and `Enter` can leave a waiting job to open another screen.
+
+Downloads run in the background: pick several uncached models from the model screen and two transfer at a time while the rest wait for a free slot. Leaving the model screen with `q` does not stop them, and the dashboard keeps reporting their progress until they finish; the microphone starts once the selected models are cached. `Esc`/`Backspace` cancels the transfer and returns to the dashboard, and quitting the dashboard cancels everything. Cancelling removes the partial file, keeps the saved selection, and leaves `Resume recording` ready to retry.
+
+Press `d` in the model screen to delete a cached model and reclaim disk space. The model currently in use is protected, so select a different one first; other cached models are removed together with any partial download.
+
+During setup, `h`/`l` or the left/right arrows choose the speech model, `f` cycles cleanup models, `c` toggles cleanup, `a` toggles audio retention, and `m` cycles microphones. Choose **Setup** later to revisit these options. Config pauses capture and finishes queued work before editing; returning resumes recording. Explore notes keeps capture running.
 
 ## Edit settings
+
+Run `contextd config` in a terminal to open the configuration TUI, styled like
+`explore`. Switch between **Speech to text** and **Cleanup / processing** with
+Tab or the left/right arrows, move with the up/down arrows, and press Enter to
+select a model. Each model shows whether it is cached locally. Missing models
+download with a live percentage and byte-count progress bar before the new
+selection is saved. Selecting a cleanup model also enables cleanup.
+
+Press `c` to toggle cleanup, `a` to toggle audio retention, and `q` or Escape to
+exit. Leaving during a download cancels it without changing the saved selection;
+retrying restarts the download. Settings changes require capture to be stopped.
+
+Use `contextd config --json` to print settings explicitly. Redirected or piped
+`contextd config` also prints JSON, keeping existing scripts compatible.
 
 Stop capture before changing settings:
 
 ```sh
-contextd config > settings.json
+contextd config --json > settings.json
 # Edit settings.json, then apply it:
 contextd config --file settings.json
-contextd start
+contextd
 ```
 
 Export the complete configuration before editing: omitted fields receive defaults.
@@ -19,8 +43,8 @@ Export the complete configuration before editing: omitted fields receive default
 |---|---|---|
 | `microphone` | `null` | Use the default input; otherwise an exact ID from `contextd microphones`. |
 | `speech_model` | `parakeet-unified-en-0.6b` | Selected speech model. Use `contextd models` to list available IDs. |
-| `filter_enabled` | `false` | Run cleanup after transcription. The first-run guide offers to enable it. |
-| `filter_model` | `hf.co/superwhisper/s1-mini-GGUF:Q4_K_M` | The supported English cleanup model. |
+| `filter_enabled` | `false` | Run cleanup after transcription. First-run TUI setup offers to enable it. |
+| `filter_model` | `hf.co/superwhisper/s1-mini-GGUF:Q4_K_M` | S1-mini, `qwen2.5-1.5b-instruct`, `qwen2.5-3b-instruct`, or `llama3.2-3b-instruct`. |
 | `language` | `auto` | Whisper language detection or a language code such as `en`. Parakeet uses English. |
 | `short_transcript_policy` | `cleanup` | Discard empty cleanup output; `skip_all` also skips every 1–3-word transcript, `keep` disables this check. |
 | `retain_audio` | `false` | Keep completed WAV clips in `audio/`. |
@@ -33,13 +57,32 @@ Model selection and microphone flags persist:
 
 ```sh
 contextd download whisper-base --select
-contextd start --microphone '<exact ID from contextd microphones>'
-contextd start --retain-audio
+contextd --retain-audio
 # Stop, then disable retention for future segments:
-contextd start --no-retain-audio
+contextd --no-retain-audio
 ```
 
-Disabling retention does not remove previously saved audio. For non-English Whisper transcription, disable S1-mini cleanup; it supports English only.
+Choose a microphone with `m` in TUI Setup, or set `microphone` in JSON.
+
+```sh
+# Several models download concurrently; --select keeps the last one
+contextd download whisper-tiny qwen2.5-1.5b-instruct --select qwen2.5-1.5b-instruct
+```
+Model IDs come from `contextd models`. Disabling retention does not remove previously saved audio. For non-English Whisper transcription, choose a multilingual cleanup model or disable cleanup; S1-mini supports English only.
+
+### Cleanup model choices
+
+| Model | Download (Q4_K_M) | Purpose |
+|---|---:|---|
+| S1-mini by Superwhisper | 484 MB | Specialized English transcript normalization; recommended default. |
+| Qwen 2.5 1.5B Instruct | 1,117 MB | Lightweight multilingual, prompt-based cleanup. |
+| Qwen 2.5 3B Instruct | 2,105 MB | Larger multilingual, prompt-based cleanup. |
+| Llama 3.2 3B Instruct | 2,019 MB | Alternative multilingual instruction model from Meta. |
+
+All run locally through embedded llama.cpp. Each model has its own cache file and
+generation protocol. General-purpose models have not yet been benchmarked against
+S1-mini in this runtime. Superwhisper also offers cloud GPT, Claude, Gemini, and
+Llama models; those hosted services are not part of this local catalog.
 
 ## Default directories
 

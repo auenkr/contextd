@@ -8,7 +8,7 @@
 - Q4_K_M artifact: **484,219,808 bytes**, approximately **484 MB / 462 MiB**.
 - About 75% smaller download than the previous ~1.9 GB Qwen 3B model.
 - Trained for filler removal, false starts, self-corrections, punctuation, capitalization, and inverse text normalization.
-- **English-only.** The current cleanup runtime supports only S1-mini; disable cleanup when using Whisper for other languages.
+- **English-only.** For other languages choose a multilingual Qwen or Llama cleanup model, or disable cleanup.
 - Runs in-process through embedded llama.cpp; Hugging Face is contacted only to download the model.
 
 Sources:
@@ -80,7 +80,9 @@ The Rust core sends the **verbatim system prompt** and `[Styling: semi-formal] [
 
 Greedy decoding (`temperature: 0`) is required. Generic chat instructions/few-shot examples and a thinking-on template are not used. Pure-filler empty output is accepted as successful cleanup; raw text is still retained. Truncated output is rejected so the pipeline can preserve the original.
 
-The embedded runtime supports idle unloading, explicit unload, direct model download, and an error fallback that preserves the raw transcript. S1-mini is the supported cleanup model; other models are not currently exposed in the catalog.
+The embedded runtime supports idle unloading, explicit unload, direct model download, and an error fallback that preserves the raw transcript. The catalog also offers Qwen 2.5 1.5B Instruct (~1,117 MB), Qwen 2.5 3B Instruct (~2,105 MB), and Llama 3.2 3B Instruct (~2,019 MB), all Q4_K_M. Qwen uses ChatML; Llama uses its Llama 3 header-token template. These general-purpose alternatives use conservative transcript-cleanup instructions and have not yet been benchmarked against S1-mini in this runtime.
+
+The upstream artifacts are published by [Qwen 1.5B](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF), [Qwen 3B](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF), and [bartowski's Llama 3.2 3B GGUF](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF). [Superwhisper's language-model catalog](https://superwhisper.com/docs/models/language) documents S1-mini locally and hosted GPT, Claude, Gemini, and Llama options. Hosted provider models require a separate cloud integration and are not listed as downloadable local weights here.
 
 ## Reproduce
 

@@ -3,7 +3,7 @@
 ## Structure
 
 - `crates/core` (`contextd-core`): capture, segmentation, model downloads, embedded inference, durable queue, SQLite history, Markdown, logging, and loopback retrieval.
-- `crates/cli` (`contextd-cli`, binary `contextd`): command parsing, first-run setup, console output, and terminal exploration/audio playback.
+- `crates/cli` (`contextd-cli`, binary `contextd`): command parsing, interactive dashboard/TUI setup, terminal exploration/audio playback, model configuration, and the shared background download queue.
 - `docs`: installation, configuration, user flows, and model research.
 - `scripts`: optional real-model validation and cleanup evaluation.
 

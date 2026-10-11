@@ -17,6 +17,58 @@ import urllib.request
 import uuid
 import wave
 import array
+import fcntl
+import pty
+import re
+import struct
+import termios
+import threading
+
+
+class DashboardProcess:
+    """Run the interactive dashboard while continuously draining its terminal."""
+    def __init__(self, binary, env):
+        self.master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
+        self.process = subprocess.Popen([binary], env=env, stdin=slave, stdout=slave, stderr=slave)
+        os.close(slave)
+        self.output = bytearray()
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+
+    def _read(self):
+        try:
+            while True:
+                chunk = os.read(self.master, 65536)
+                if not chunk:
+                    break
+                self.output.extend(chunk)
+        except OSError:
+            pass
+
+    @property
+    def text(self):
+        # Cursor movement replaces skipped blank cells when matching log text.
+        return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", " ", self.output.decode(errors="replace"))
+
+    @property
+    def returncode(self):
+        return self.process.returncode
+
+    def poll(self):
+        return self.process.poll()
+
+    def send_signal(self, sig):
+        self.process.send_signal(sig)
+
+    def kill(self):
+        self.process.kill()
+
+    def communicate(self, timeout=None):
+        self.process.wait(timeout=timeout)
+        self.reader.join(timeout=2)
+        os.close(self.master)
+        return "", self.text
 
 
 class Validation:
@@ -76,12 +128,25 @@ class Validation:
         print(f"SKIP {name}: {reason}", flush=True)
 
     def start(self, *args, env=None, executable=None):
+        if not args and executable is None:
+            process = DashboardProcess(self.binary, env or self.env)
+            self.processes.append(process)
+            return process
         process = subprocess.Popen([executable or self.binary, *args], env=env or self.env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.processes.append(process)
         return process
 
     def wait_listening(self, process):
+        if isinstance(process, DashboardProcess):
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if "Listening" in process.text:
+                    return process.text
+                if process.poll() is not None:
+                    raise AssertionError("Dashboard exited: " + process.text[-3000:])
+                time.sleep(0.1)
+            raise AssertionError("Microphone startup timed out: " + process.text[-3000:])
         deadline = time.monotonic() + 12
         lines = []
         while time.monotonic() < deadline:
@@ -117,8 +182,9 @@ class Validation:
         assert self.defaults["filter_model"] == "hf.co/superwhisper/s1-mini-GGUF:Q4_K_M"
         assert not self.defaults["filter_enabled"]
         assert self.defaults["microphone"] is None
-        assert "--microphone" in self.run("start", "--help").stdout
-        return "Fresh setup uses Parakeet, keeps all speech, and exposes the start command"
+        self.run("start", ok=False)
+        assert "interactive terminal" in self.run(ok=False).stderr
+        return "Fresh defaults use Parakeet; recording is available through the interactive dashboard"
 
     def invalid_inputs(self):
         self.run("note", "  ", ok=False)
@@ -199,17 +265,25 @@ class Validation:
         assert microphones
         self.microphone = next((m["id"] for m in microphones if "MacBook" in m["name"]), microphones[0]["id"])
         self.config(microphone="disconnected:missing")
-        result = self.run("start", ok=False, timeout=15)
-        assert "disconnected" in result.stderr
+        process = self.start()
+        deadline = time.monotonic() + 15
+        while "disconnected" not in process.text and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert "disconnected" in process.text
+        self.stop(process)
         self.config(microphone=self.microphone, idle_unload_seconds=2)
         assert self.json("config")["microphone"] == self.microphone
         return f"Enumerated actual inputs; selected {self.microphone}; disconnected input fails clearly"
 
     def recording(self):
-        process = self.start("start", "--microphone", self.microphone)
+        process = self.start()
         self.wait_listening(process)
-        second = self.run("start", ok=False)
-        assert "already listening" in second.stderr
+        second = self.start()
+        deadline = time.monotonic() + 15
+        while "Another" not in second.text and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert "Another" in second.text
+        self.stop(second)
         changed = self.root / "while-recording.json"
         current = self.json("config")
         changed.write_text(json.dumps({**current, "silence_ms": 1800}))
@@ -228,7 +302,7 @@ class Validation:
         job = {"id": job_id, "settings": self.json("config"), "segment": {"samples": samples, "started_at": started.isoformat()}}
         path = self.home / "pending/recovered-speech.json"
         path.write_text(json.dumps(job))
-        process = self.start("start")
+        process = self.start()
         self.wait_listening(process)
         deadline = time.monotonic() + 90
         while path.exists() and time.monotonic() < deadline:
@@ -240,10 +314,10 @@ class Validation:
         file = self.markdown(entry)
         assert "## Around 2:00 PM" in file.read_text()
         assert file.name == f"{started.date()}.md"
-        assert "Models unloaded" in stderr, "Idle-unload event not visible/observed"
+        assert "unloaded" in stderr, "Idle-unload event not visible/observed"
         # Replay the same saved job after a crash; its stable ID prevents duplication.
         path.write_text(json.dumps(job))
-        process = self.start("start")
+        process = self.start()
         self.wait_listening(process)
         time.sleep(1)
         self.stop(process, sig=signal.SIGTERM)

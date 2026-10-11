@@ -2,7 +2,7 @@
 
 contextd continuously builds local context from speech for you and your agents. The reusable `contextd-core` Rust crate owns recording, inference, model management, and storage. The `contextd` CLI is an adapter built on that crate.
 
-**Current default:** Parakeet Unified EN 0.6B (Q8_0), full transcription, automatic daily Markdown files. The settings default has cleanup **off**; the first-run guide offers to enable it. Original transcripts are preserved either way.
+**Current default:** Parakeet Unified EN 0.6B (Q8_0), full transcription, automatic daily Markdown files. The stored default has cleanup **off**; first-run TUI setup offers to enable it. Original transcripts are preserved either way.
 
 When cleanup is enabled, the default is **"S1-mini" by "Superwhisper"**: a specialized 0.6B transcript-normalization model, with a 462 MiB / 484 MB Q4_K_M download.
 
@@ -14,7 +14,7 @@ Install the build requirements in [Installation](docs/INSTALLATION.md), then:
 git clone https://github.com/auenkr/contextd.git
 cd contextd
 cargo install --path crates/cli --locked
-contextd start
+contextd
 ```
 
 On first launch, choose your speech model, whether to enable cleanup, and whether to retain audio. Choices persist for later runs. Speak normally and pause: transcription and cleanup run while recording continues. Press Ctrl+C to finish queued work and exit.
@@ -73,7 +73,11 @@ Dates and readable times follow the laptop's local timezone. The precise start t
 
 Files are updated after transcription and optional cleanup finish. By default, empty cleanup output is discarded before saving; accepted entries preserve both the original and cleaned text. The original appears in a collapsible section when it differs. Cleanup failures save the original and report the error. Completed recording jobs stay in the durable queue until processing and persistence succeed. The Markdown files are generated from the index: put hand edits in separate files or use **Add note**; editing a generated daily file directly will be overwritten when that day is updated.
 
-On first launch, `contextd start` (or bare `contextd`) starts setup and asks whether to keep processed audio clips. Clips are off by default; when enabled, processed WAVs are stored under `audio/`. Pending segments are temporary and removed after processing. `start` runs continuously in the foreground, with audio processing alongside capture.
+Bare `contextd` opens a colored recording dashboard and starts capture automatically after setup. The left sidebar offers **Pause / Resume recording**, **Config**, **Explore notes**, **Setup**, and **Quit**. Live microphone activity, original transcripts, cleaned text, saved note paths, and errors appear in the right-hand log panel. Vi keys (`h`/`j`/`k`/`l`, `g`/`G`) navigate, `?` opens help, and `Backspace` leaves Setup and returns to recording.
+
+Missing models download before recording starts. The bottom gauge shows percentage and megabytes, the same progress is echoed line by line into the live log, and the status bar reads **Downloading models**. Downloads run in the background and keep reporting after you leave the screen that started them; selecting two or more models transfers two at a time with the rest queued. Press `Esc` or `Backspace` to abandon a download and stay on the dashboard, `q` to cancel and exit, and `Resume recording` to retry. `d` in the model browser deletes a cached model (the one in use is protected), so large unused models can be rolled back to free disk space. Config pauses recording before editing and resumes it on return; Explore notes keeps recording running.
+
+On first launch, setup appears inside the TUI. Choose speech and cleanup models, microphone, and audio retention, then press Enter to save settings, download missing models with live progress, and begin recording. Clips are off by default; when enabled, processed WAVs are stored under `audio/`. Pending segments are temporary and removed after processing. The dashboard runs continuously in the foreground, with audio processing alongside capture.
 
 Existing installations migrate automatically from the previous macOS `~/Library` locations or single-directory `~/.config/contextd` and `~/.config/record_everything` layouts: settings, models, notes, audio, history, pending jobs, and logs move to their new locations. Capture must be stopped first. Existing destination files are never overwritten. On macOS/Linux, legacy file and directory links keep old paths accessible; stored audio references are updated. Migration is recorded so later searches and exploration can run alongside capture.
 
@@ -100,17 +104,17 @@ contextd paths
 contextd models
 contextd download parakeet-unified-en-0.6b --select
 contextd microphones
-contextd start
-
-# First launch: interactive model, cleanup, and audio-retention setup, then continuous recording
 contextd
+
+# Open the recording dashboard (first run includes TUI setup)
+contextd
+contextd config
 
 # Persist the data location or processed-audio preference
 contextd --data-dir "$HOME/contextd" --retain-audio
 contextd --no-retain-audio config
 
-# Use the exact ID printed by `microphones`:
-contextd start --microphone '0:MacBook Air Microphone'
+# Choose the microphone inside the dashboard's Setup section (m to cycle).
 
 # Transcribe an existing WAV; it also becomes a daily note:
 contextd transcribe ./audio.wav
@@ -132,7 +136,7 @@ Ctrl+C (or SIGTERM on macOS/Linux) stops capture, flushes the final utterance, a
 
 ## Processing logs
 
-The terminal shows only completed entries with their speech/note time, original transcription, final saved text after optional cleanup, and note path. Native model, Metal compilation, and decoder timing messages are suppressed. Errors and download progress remain visible. Use `contextd start --verbose` to also show microphone input, signal levels, speech detection, queueing, processing, and model unloading. Activity diagnostics continue to be saved in `activity.jsonl` in the resolved logs directory.
+The dashboard's right-hand panel shows microphone activity, speech detection, queueing, original transcription, final saved text after optional cleanup, and note paths. Native model, Metal compilation, and decoder timing messages are suppressed. Errors and model download progress remain visible. Page Up / Page Down scroll the log; End returns to the latest entries. Activity diagnostics continue to be saved in `activity.jsonl` in the resolved logs directory.
 
 Every saved transcript or manual note produces a completion log on stderr and appends a JSON record to `processing.jsonl` in the resolved logs directory. Records include the completion timestamp, speech/note start time, original text, final saved text, absolute Markdown and history paths, and the retained audio path (or `null` when audio was not retained). Cleanup failures are recorded with the original text that was saved.
 
@@ -199,7 +203,7 @@ This selects S1-mini for cleanup. Older cleanup model names from Ollama-based se
 
 The core uses S1-mini's documented training format, greedy decoding, and required empty thinking prefix through embedded llama.cpp. It uses `semi-formal` / `prose` / `general`. S1-mini needs this specialized format; it is not sent generic chat instructions or few-shot examples. Its style can also normalize spoken numbers and colloquial phrasing.
 
-Enable cleanup through the first-run guide, or export settings with `contextd config > settings.json`, set `filter_enabled` to `true`, and apply them with `contextd config --file settings.json` while capture is stopped. The prompt removes fillers, repetition, abandoned starts, and explicit self-corrections with minimal word changes. It preserves names, numbers, substantive detail, tone, and language. For example:
+Enable cleanup in TUI Setup, or export settings with `contextd config --json > settings.json`, set `filter_enabled` to `true`, and apply them with `contextd config --file settings.json` while capture is stopped. The prompt removes fillers, repetition, abandoned starts, and explicit self-corrections with minimal word changes. It preserves names, numbers, substantive detail, tone, and language. For example:
 
 ```text
 Before: Um, ship this Tuesday, no, Wednesday, with the new design.

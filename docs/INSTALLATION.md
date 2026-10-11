@@ -34,16 +34,16 @@ git clone https://github.com/auenkr/contextd.git
 cd contextd
 cargo install --path crates/cli --locked
 contextd --help
-contextd start
+contextd
 ```
 
-Cargo installs `contextd` into `$CARGO_HOME/bin`, normally `~/.cargo/bin`. Make sure that directory is on PATH. Models are downloaded by the first-run setup; they are not bundled with the executable. After setup, settings and models are reused.
+Cargo installs `contextd` into `$CARGO_HOME/bin`, normally `~/.cargo/bin`. Make sure that directory is on PATH. Models are downloaded during first-run TUI setup or by Config; they are not bundled with the executable. Afterwards, settings and models are reused.
 
 ## Build and run without installing
 
 ```sh
 cargo build --release --locked -p contextd-cli
-./target/release/contextd start
+./target/release/contextd
 # Or build and run in one command:
 cargo run --release --locked -p contextd-cli -- start
 ```
@@ -69,7 +69,7 @@ Uninstalling the binary leaves your settings, notes, downloaded models, and logs
 
 ```sh
 tmux new -s contextd
-contextd start
+contextd
 ```
 
 Detach with Ctrl+B, then D. Return with `tmux attach -t contextd`. The computer must stay awake for recording; this is not an installed system daemon.
@@ -81,7 +81,7 @@ Detach with Ctrl+B, then D. Return with `tmux attach -t contextd`. The computer 
 | `contextd: command not found` | Add Cargo's `bin` directory to PATH, or run `~/.cargo/bin/contextd`. |
 | Build cannot find CMake or libclang | Install the native requirements above. Bindgen also accepts `LIBCLANG_PATH` pointing to the directory containing your libclang shared library. |
 | macOS microphone access blocked | Enable the terminal host under System Settings → Privacy & Security → Microphone, then restart that app. Some embedded terminal hosts lack the required audio-input entitlement; use Terminal or Ghostty instead. |
-| Listening but no transcript | Check System Settings' input meter and the selected microphone. Run `contextd start --verbose` to inspect audio duration, RMS, speech threshold, and processing errors. Pause long enough to finish a segment. |
+| Listening but no transcript | Check System Settings' input meter and the selected microphone. The dashboard's live log shows audio duration, RMS, speech threshold, and processing errors. Pause long enough to finish a segment. |
 | Speech is too quiet or noisy | Stop capture, adjust `speech_threshold` using the [configuration guide](CONFIGURATION.md), then restart. |
 | Another process owns recording | Stop the other recorder or use a separate `--data-dir`. One data directory allows one capture owner. |
 | Cleanup fails | The original transcript remains saved. Check the reported error and that S1-mini is installed; disable cleanup if needed. |

@@ -13,26 +13,26 @@ contextd models
 contextd download parakeet-unified-en-0.6b --select
 ```
 
-**Checkpoint:** Parakeet Unified EN 0.6B is default; cleanup is off. The downloaded model appears as installed. Repeat downloads leave its file intact. `contextd start` downloads selected models when needed and opens setup if settings have not yet been saved. Keep the same storage environment variable in later sessions; otherwise platform directories are used (inspect them with `contextd paths`). Existing single-directory installations are migrated automatically.
+**Checkpoint:** Parakeet Unified EN 0.6B is default; stored settings default to cleanup off, while first-run TUI setup offers cleanup enabled. The downloaded model appears as installed. Repeat downloads leave its file intact. `contextd` opens TUI setup if settings have not yet been saved, downloads missing selected models, and begins recording. Keep the same storage environment variable in later sessions; otherwise platform directories are used (inspect them with `contextd paths`). Existing single-directory installations are migrated automatically.
 
 ## 2. Select microphone and record
 
 ```sh
 contextd microphones
-contextd start --microphone '0:MacBook Air Microphone'
+contextd
 ```
 
-Use the exact ID printed on your laptop. Selection persists, so next time:
+Choose **Setup** and press `m` to cycle available microphones. Selection persists, so next time:
 
 ```sh
-contextd start
+contextd
 ```
 
-**Checkpoint:** the CLI prints `Listening. Speech is processed automatically. Ctrl+C to stop.`. Speak and pause; entries appear in the terminal and `notes/YYYY-MM-DD.md`. Another process cannot record into the same directory or change settings during capture.
+**Checkpoint:** the dashboard shows **Listening**, navigation on the left, and live processing logs on the right. Missing models download first with the gauge, per-percent log lines, and **Downloading models** status; several selected models transfer at once and progress continues after switching screens. `Esc` cancels the transfer and returns to the dashboard. Arrow keys and `h`/`j`/`k`/`l` move and change selections, `g`/`G` jump to the first and last item, and `?` opens a help panel listing every binding. `Backspace` leaves Setup without saving; `q`, Esc, or Ctrl+C stops recording and exits. Speak and pause; entries appear in the log and `notes/YYYY-MM-DD.md`. Another process cannot record into the same directory or change settings during capture. Config pauses recording before editing; returning resumes it.
 
-Each saved entry shows its local speech start time, original and saved text, and absolute note path on stderr. Completion time, IDs, and history paths are also retained in the JSON log and displayed with `--verbose`. Retained clips also include the audio path. The same record is appended to `processing.jsonl` in the logs directory shown by `contextd paths` (or `<data-dir>/logs` for portable storage). Manual notes and imported recordings also generate completion logs; cleanup failures identify the original text that was saved.
+Each saved entry shows original and saved text and the absolute note path in the dashboard log. Speech start time, completion time, IDs, retained audio paths, and history paths are retained in `processing.jsonl` in the logs directory shown by `contextd paths` (or `<data-dir>/logs` for portable storage). Manual notes and imported recordings also generate completion logs; cleanup failures identify the original text that was saved.
 
-With `contextd start --verbose`, activity logs show the selected microphone, speech detection, queueing, transcription, and cleanup. Every ten seconds an input summary reports how much audio arrived, its peak RMS signal level, the speech threshold, and whether speech is being collected. These lines are saved in `activity.jsonl` in that logs directory. If no completion appears, this distinguishes missing audio input from input that stays below the speech threshold or a segment still being processed.
+Dashboard activity logs show the selected microphone, speech detection, queueing, transcription, and cleanup. Every ten seconds an input summary reports how much audio arrived, its peak RMS signal level, the speech threshold, and whether speech is being collected. These lines are saved in `activity.jsonl` in that logs directory. If no completion appears, this distinguishes missing audio input from input that stays below the speech threshold or a segment still being processed.
 
 ## 3. Stop and read notes
 
@@ -97,7 +97,7 @@ contextd download parakeet-unified-en-0.6b --select
 ## 7. Tune recording and offloading
 
 ```sh
-contextd config > settings.json
+contextd config --json > settings.json
 # Edit the file:
 contextd config --file settings.json
 ```
@@ -110,11 +110,11 @@ Useful fields: `microphone`, `silence_ms`, `speech_threshold`, `retain_audio`, `
 
 ```sh
 contextd download hf.co/superwhisper/s1-mini-GGUF:Q4_K_M --select
-contextd config > settings.json
+contextd config --json > settings.json
 # Set filter_enabled to true, then:
 contextd config --file settings.json
 contextd refine 'Um, ship this Tuesday, no, Wednesday, with the new design.'
-contextd start
+contextd
 ```
 
 **Validated S1-mini output:** `Ship this Wednesday with the new design.`
@@ -126,7 +126,7 @@ The default is **"S1-mini" by "Superwhisper"**, a 0.6B model fine-tuned for this
 ## 9. Resume after interruption
 
 ```sh
-contextd start
+contextd
 ```
 
 **Checkpoint:** completed `pending/` jobs are retried with original times/settings, then removed on success. Replay uses a stable ID and does not duplicate a persisted note. Failed jobs remain queued and are reported. An unfinished in-memory segment cannot survive SIGKILL; Ctrl+C/SIGTERM flushes it.

@@ -5,8 +5,12 @@ use contextd_core::{
     config::{DATA_HOME_ENV, PRODUCT_NAME},
     models, Event, Service,
 };
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
+mod configure;
+mod downloads;
 mod explore;
+mod home;
+mod tui;
 
 #[derive(Parser)]
 #[command(
@@ -37,26 +41,25 @@ struct Args {
 enum Command {
     /// Browse saved notes and play retained audio in the terminal.
     Explore,
-    /// Continuously record your selected microphone until Ctrl+C.
-    #[command(alias = "record")]
-    Start {
-        #[arg(long)]
-        microphone: Option<String>,
-    },
     /// List microphone IDs for config or --microphone.
     Microphones,
     /// Show the resolved config, data, cache, and log directories.
     Paths,
     Models,
+    /// Download one or more models; multiple downloads run at the same time.
     Download {
-        id: String,
+        /// Model IDs from the catalog, for example parakeet-unified-en-0.6b whisper-tiny
+        #[arg(required = true)]
+        ids: Vec<String>,
         #[arg(long)]
         select: bool,
     },
-    /// Display settings or apply a JSON settings file.
+    /// Configure models interactively, display JSON, or apply a settings file.
     Config {
         #[arg(long)]
         file: Option<std::path::PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
     Transcribe {
         file: std::path::PathBuf,
@@ -107,6 +110,46 @@ async fn main() -> Result<()> {
     }
     let service = Service::new()?;
     let first_run = !service.paths.settings_path().exists();
+    // One download queue serves both screens, so a transfer survives leaving it.
+    let downloads =
+        crate::downloads::Downloads::new(service.clone(), tokio::runtime::Handle::current());
+    if args.command.is_none() {
+        let runtime = tokio::runtime::Handle::current();
+        let dashboard_service = service.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            home::run(
+                dashboard_service,
+                runtime,
+                downloads.clone(),
+                first_run,
+                if args.retain_audio {
+                    Some(true)
+                } else if args.no_retain_audio {
+                    Some(false)
+                } else {
+                    None
+                },
+            )
+        })
+        .await;
+        service.stop().await?;
+        return result?;
+    }
+    if matches!(
+        args.command,
+        Some(Command::Config {
+            file: None,
+            json: false
+        })
+    ) && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+    {
+        let runtime = tokio::runtime::Handle::current();
+        return tokio::task::spawn_blocking(move || {
+            configure::run(service, runtime, downloads.clone())
+        })
+        .await?;
+    }
     let retain_audio_override = if args.retain_audio {
         Some(true)
     } else if args.no_retain_audio {
@@ -149,36 +192,7 @@ async fn main() -> Result<()> {
     });
     let result = async {
         match args.command {
-            command @ (None | Some(Command::Start { .. })) => {
-                if let Some(Command::Start {
-                    microphone: Some(microphone),
-                }) = command
-                {
-                    let mut settings = service.settings();
-                    settings.microphone = Some(microphone);
-                    service.save_settings(settings).await?;
-                }
-                let settings = if first_run {
-                    startup_guide(&service, retain_audio_override).await?
-                } else {
-                    service.settings()
-                };
-                ensure_selected_models(&service, &settings).await?;
-                service.start().await?;
-                eprintln!(
-                    "{} data: {} (processed audio clips: {})",
-                    contextd_core::config::PRODUCT_NAME,
-                    service.paths.root.display(),
-                    if settings.retain_audio {
-                        "saved"
-                    } else {
-                        "not saved"
-                    }
-                );
-                eprintln!("Listening. Speech is processed automatically. Ctrl+C to stop.");
-                shutdown_signal().await?;
-                service.stop().await?;
-            }
+            None => unreachable!("dashboard is handled above"),
             Some(command) => match command {
                 Command::Explore => unreachable!("explore is handled before service startup"),
                 Command::Microphones => {
@@ -189,22 +203,32 @@ async fn main() -> Result<()> {
                     let models = models::list(&service.paths).await?;
                     println!("{}", serde_json::to_string_pretty(&models)?);
                 }
-                Command::Download { id, select } => {
-                    models::download(&service.paths, &id, &service.events).await?;
-                    if select {
+                Command::Download { ids, select } => {
+                    // Queue every model before waiting, so transfers overlap.
+                    for id in &ids {
+                        downloads.enqueue(id);
+                    }
+                    let mut selection = None;
+                    for id in &ids {
+                        if select {
+                            selection = Some(id);
+                        }
+                        downloads.wait(id).await?;
+                    }
+                    if let Some(id) = selection {
                         let mut settings = service.settings();
                         if models::catalog(&service.paths)
                             .iter()
-                            .any(|m| m.id == id && m.kind == "speech")
+                            .any(|m| m.id == *id && m.kind == "speech")
                         {
-                            settings.speech_model = id;
+                            settings.speech_model = id.clone();
                         } else {
-                            settings.filter_model = id;
+                            settings.filter_model = id.clone();
                         }
                         service.save_settings(settings).await?;
                     }
                 }
-                Command::Config { file } => {
+                Command::Config { file, .. } => {
                     if let Some(path) = file {
                         service
                             .save_settings(serde_json::from_slice(&std::fs::read(path)?)?)
@@ -212,7 +236,6 @@ async fn main() -> Result<()> {
                     }
                     println!("{}", serde_json::to_string_pretty(&service.settings())?);
                 }
-                Command::Start { .. } => unreachable!("start is handled above"),
                 Command::Transcribe { file } => {
                     if let Some(entry) = service
                         .process(audio::read_wav(&file)?, service.settings())
@@ -341,67 +364,6 @@ fn print_event(event: Event, last_progress: &mut (String, u64), verbose: bool) {
         }
         _ => {}
     }
-}
-
-async fn startup_guide(
-    service: &Service,
-    retain_audio_override: Option<bool>,
-) -> Result<contextd_core::Settings> {
-    let mut settings = service.settings();
-    eprintln!("\nWelcome to {PRODUCT_NAME}\n\nChoose a speech model:");
-    eprintln!("  1) Parakeet Unified EN 0.6B (recommended, English, fast, ~731 MB)");
-    eprintln!("  2) Whisper Base (multilingual, balanced, ~142 MB)");
-    let speech_choice = prompt("Speech model [1]: ")?;
-    let speech_id = if speech_choice.trim() == "2" {
-        "whisper-base"
-    } else {
-        "parakeet-unified-en-0.6b"
-    };
-    settings.speech_model = speech_id.to_owned();
-
-    let cleanup_choice =
-        prompt("Enable speech cleanup to remove filler words and repetitions? [Y/n]: ")?;
-    settings.filter_enabled = !matches!(
-        cleanup_choice.trim().to_ascii_lowercase().as_str(),
-        "n" | "no"
-    );
-    if retain_audio_override.is_none() {
-        let retain_choice = prompt("Keep processed audio clips as WAV files? [y/N]: ")?;
-        settings.retain_audio = matches!(
-            retain_choice.trim().to_ascii_lowercase().as_str(),
-            "y" | "yes"
-        );
-    }
-    if settings.filter_enabled {
-        eprintln!("\nCleanup model:");
-        eprintln!("  S1-mini (transcript cleanup, English, ~484 MB; runs locally in this app)");
-        let _ = prompt("Press Enter to use S1-mini: ")?;
-        let id = models::DEFAULT_FILTER_MODEL;
-        settings.filter_model = id.to_owned();
-    }
-
-    service.save_settings(settings.clone()).await?;
-    Ok(settings)
-}
-
-async fn ensure_selected_models(
-    service: &Service,
-    settings: &contextd_core::Settings,
-) -> Result<()> {
-    eprintln!("\nDownloading selected models when needed.");
-    models::download(&service.paths, &settings.speech_model, &service.events).await?;
-    if settings.filter_enabled {
-        models::download(&service.paths, &settings.filter_model, &service.events).await?;
-    }
-    Ok(())
-}
-
-fn prompt(label: &str) -> Result<String> {
-    eprint!("{label}");
-    io::stderr().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    Ok(input)
 }
 
 async fn shutdown_signal() -> Result<()> {
