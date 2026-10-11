@@ -22,3 +22,7 @@ __pycache__/
 *.sqlite3-wal
 *.sqlite3-shm
 /validation-results.json
+
+# Generated product-video workspace (published assets live in docs/media)
+/brag-output/
+/brag-output-*/
