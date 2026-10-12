@@ -405,7 +405,10 @@ pub(crate) fn sync_speaker_names(
         .truncate(false)
         .write(true)
         .open(directory.join(".write.lock"))?;
-    lock.lock_exclusive()?;
+    // Daily inference can hold this lock for minutes. Keep the speaker outbox
+    // pending rather than blocking the UI or runtime shutdown behind inference.
+    lock.try_lock_exclusive()
+        .context("Daily structuring is busy; speaker changes remain queued")?;
     let history = History::open(paths)?;
     let entries = history.for_day(day)?;
     if entries.is_empty() {
@@ -431,7 +434,7 @@ pub(crate) fn sync_speaker_names(
                 .eq(0..entries.len())
     });
     if !reusable {
-        history.sync_day(&entries[0].created_at)?;
+        history.try_sync_day(&entries[0].created_at, true)?;
         return Ok(()); // Existing metadata is saved; the daily worker will regroup.
     }
     let state = state.as_mut().unwrap();
@@ -454,7 +457,7 @@ pub(crate) fn sync_speaker_names(
         std::fs::write(&temporary, &document)?;
         std::fs::rename(temporary, &state_path)?;
         if original_existed {
-            history.sync_day_preserving_structure(&entries[0].created_at)?;
+            history.try_sync_day(&entries[0].created_at, false)?;
         }
         expire_transcription(paths, settings, day, Local::now().date_naive())
     })

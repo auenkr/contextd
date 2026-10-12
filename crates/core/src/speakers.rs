@@ -58,7 +58,27 @@ pub fn connection(paths: &Paths) -> Result<Connection> {
         CREATE TABLE IF NOT EXISTS dismissed_speaker_turns (id TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS speaker_aliases (id TEXT PRIMARY KEY, speaker_id TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS speaker_embeddings (id TEXT PRIMARY KEY, speaker_id TEXT NOT NULL, embedding TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS speaker_training_examples (
+            id TEXT PRIMARY KEY, speaker_id TEXT, embedding TEXT NOT NULL,
+            created_at TEXT NOT NULL, trained INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS speaker_prototypes (
+            speaker_id TEXT PRIMARY KEY, embedding TEXT NOT NULL, example_count INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS speaker_learning_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1), last_trained_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS speaker_sync (day TEXT NOT NULL, speaker_id TEXT NOT NULL, old_name TEXT NOT NULL, new_name TEXT NOT NULL, PRIMARY KEY(day,speaker_id));",
+    )?;
+    // Backfill user-confirmed links created before adaptive profiles existed.
+    // Skip embeddings already present in the labeled training table.
+    connection.execute(
+        "INSERT OR IGNORE INTO speaker_training_examples (id,speaker_id,embedding,created_at,trained)
+         SELECT 'legacy:' || e.id, e.speaker_id, e.embedding,
+                strftime('%Y-%m-%dT%H:%M:%f+00:00','now'), 0
+         FROM speaker_embeddings e
+         WHERE NOT EXISTS (
+             SELECT 1 FROM speaker_training_examples t
+             WHERE t.speaker_id=e.speaker_id AND t.embedding=e.embedding
+         )",
+        [],
     )?;
     Ok(connection)
 }
@@ -153,6 +173,7 @@ pub fn rename(paths: &Paths, settings: &Settings, id: &str, name: &str) -> Resul
 /// Link a duplicate profile, or `unknown:TRANSCRIPT_ID:TURN_INDEX` (zero based),
 /// to a saved identity. Keep every confirmed embedding instead of averaging voices.
 pub fn link(paths: &Paths, settings: &Settings, source: &str, target: &str) -> Result<()> {
+    use rusqlite::OptionalExtension;
     crate::history::History::open(paths)?;
     let target = uuid::Uuid::parse_str(target)?.to_string();
     let mut connection = connection(paths)?;
@@ -171,7 +192,25 @@ pub fn link(paths: &Paths, settings: &Settings, source: &str, target: &str) -> R
             Ok((uuid::Uuid::parse_str(id)?.to_string(), index.parse()?))
         })
         .transpose()?;
-    let old = if unknown.is_some() {
+    let old = if let Some((transcript_id, index)) = &unknown {
+        let example_id = format!("unknown:{transcript_id}:{index}");
+        let embedding: Option<String> = tx
+            .query_row(
+                "SELECT embedding FROM speaker_training_examples WHERE id=?1",
+                [&example_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(embedding) = embedding {
+            tx.execute(
+                "INSERT OR REPLACE INTO speaker_embeddings VALUES (?1,?2,?3)",
+                params![example_id, target, embedding],
+            )?;
+            tx.execute(
+                "UPDATE speaker_training_examples SET speaker_id=?2, trained=0 WHERE id=?1",
+                params![example_id, target],
+            )?;
+        }
         "Unknown speaker".to_string()
     } else {
         let source = uuid::Uuid::parse_str(source)?.to_string();
@@ -183,6 +222,34 @@ pub fn link(paths: &Paths, settings: &Settings, source: &str, target: &str) -> R
                 r.get(0)
             })
             .context("Source speaker not found")?;
+        let mut examples = vec![(
+            format!("linked:{source}:{source}"),
+            tx.query_row(
+                "SELECT embedding FROM speakers WHERE id=?1",
+                [&source],
+                |row| row.get::<_, String>(0),
+            )?,
+        )];
+        {
+            let mut statement =
+                tx.prepare("SELECT id, embedding FROM speaker_embeddings WHERE speaker_id=?1")?;
+            examples.extend(
+                statement
+                    .query_map([&source], |row| {
+                        Ok((
+                            format!("linked:{source}:{}", row.get::<_, String>(0)?),
+                            row.get::<_, String>(1)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            );
+        }
+        for (id, embedding) in examples {
+            tx.execute(
+                "INSERT OR IGNORE INTO speaker_training_examples (id,speaker_id,embedding,created_at,trained) VALUES (?1,?2,?3,?4,0)",
+                params![id, target, embedding, chrono::Utc::now().to_rfc3339()],
+            )?;
+        }
         tx.execute(
             "INSERT INTO speaker_embeddings SELECT id,?2,embedding FROM speakers WHERE id=?1",
             params![source, target],
@@ -199,12 +266,30 @@ pub fn link(paths: &Paths, settings: &Settings, source: &str, target: &str) -> R
             "INSERT INTO speaker_aliases VALUES (?1,?2)",
             params![source, target],
         )?;
+        tx.execute(
+            "UPDATE speaker_training_examples SET speaker_id=?2, trained=0 WHERE speaker_id=?1",
+            params![source, target],
+        )?;
+        tx.execute(
+            "DELETE FROM speaker_prototypes WHERE speaker_id=?1",
+            [&source],
+        )?;
         tx.execute("DELETE FROM speakers WHERE id=?1", [&source])?;
         old
     };
     let documents: Vec<String> = {
-        let mut statement = tx.prepare("SELECT document FROM transcripts")?;
-        let rows = statement.query_map([], |r| r.get(0))?;
+        let (query, key) = if let Some((id, _)) = &unknown {
+            ("SELECT document FROM transcripts WHERE id=?1", id.as_str())
+        } else {
+            (
+                "SELECT document FROM transcripts WHERE EXISTS (
+                 SELECT 1 FROM json_each(transcripts.document,'$.speaker_turns')
+                 WHERE json_extract(value,'$.speaker_id')=?1)",
+                source,
+            )
+        };
+        let mut statement = tx.prepare(query)?;
+        let rows = statement.query_map([key], |r| r.get(0))?;
         rows.collect::<std::result::Result<_, _>>()?
     };
     let mut changed = false;
@@ -255,6 +340,122 @@ pub fn link(paths: &Paths, settings: &Settings, source: &str, target: &str) -> R
         .context("Link saved; note synchronization will retry on next app start")
 }
 
+/// Keep embeddings for unassigned, non-overlapping turns until a person confirms
+/// their identity. The audio itself remains governed by normal retention rules.
+pub fn store_unlabeled_examples(
+    paths: &Paths,
+    transcript_id: &str,
+    turns: &[SpeakerTurn],
+    embeddings: &[Option<Vec<f32>>],
+) -> Result<()> {
+    let connection = connection(paths)?;
+    for (index, (turn, embedding)) in turns.iter().zip(embeddings).enumerate() {
+        if turn.speaker_id.is_some() || turn.overlap {
+            continue;
+        }
+        let Some(embedding) = embedding else { continue };
+        let embedding = normalized(embedding)?;
+        let id = format!("unknown:{transcript_id}:{index}");
+        connection.execute(
+            "INSERT OR IGNORE INTO speaker_training_examples (id,speaker_id,embedding,created_at,trained) VALUES (?1,NULL,?2,?3,0)",
+            params![id, serde_json::to_string(&embedding)?, chrono::Utc::now().to_rfc3339()],
+        )?;
+    }
+    Ok(())
+}
+
+/// Train and persist the personalized speaker-matching weights after enough
+/// new, explicitly labeled examples have accumulated and the cooldown elapsed.
+/// The downloaded WeSpeaker embedding network stays frozen; these class
+/// centroids are the small supervised matching head used by future scans.
+pub fn train_profiles_if_due(paths: &Paths) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    const MIN_NEW_EXAMPLES: i64 = 10;
+    const COOLDOWN: chrono::Duration = chrono::Duration::hours(6);
+    let mut connection = connection(paths)?;
+    let (new_examples, oldest_new): (i64, Option<String>) = connection.query_row(
+        "SELECT COUNT(*), MIN(created_at) FROM speaker_training_examples WHERE speaker_id IS NOT NULL AND trained=0",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if new_examples < MIN_NEW_EXAMPLES {
+        return Ok(false);
+    }
+    let now = chrono::Utc::now();
+    let last_trained: Option<String> = connection
+        .query_row(
+            "SELECT last_trained_at FROM speaker_learning_state WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let cooldown_start = last_trained
+        .or(oldest_new)
+        .context("No speaker examples to train")?;
+    let cooldown_start =
+        chrono::DateTime::parse_from_rfc3339(&cooldown_start)?.with_timezone(&chrono::Utc);
+    if now - cooldown_start < COOLDOWN {
+        return Ok(false);
+    }
+
+    let tx = connection.transaction()?;
+    let mut grouped = std::collections::HashMap::<String, Vec<Vec<f32>>>::new();
+    {
+        let mut statement = tx.prepare(
+            "SELECT speaker_id, embedding FROM speaker_training_examples WHERE speaker_id IS NOT NULL",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (speaker_id, embedding) = row?;
+            grouped
+                .entry(speaker_id)
+                .or_default()
+                .push(serde_json::from_str(&embedding)?);
+        }
+    }
+    let mut trained = 0usize;
+    for (speaker_id, examples) in grouped {
+        let dimensions = examples.first().map_or(0, Vec::len);
+        let mut prototype = vec![0.0f32; dimensions];
+        let mut usable = 0usize;
+        for example in examples {
+            if example.len() != dimensions || !example.iter().all(|value| value.is_finite()) {
+                continue;
+            }
+            for (sum, value) in prototype.iter_mut().zip(example) {
+                *sum += value;
+            }
+            usable += 1;
+        }
+        if usable == 0 {
+            continue;
+        }
+        for value in &mut prototype {
+            *value /= usable as f32;
+        }
+        let prototype = normalized(&prototype)?;
+        tx.execute(
+            "INSERT INTO speaker_prototypes VALUES (?1,?2,?3) ON CONFLICT(speaker_id) DO UPDATE SET embedding=excluded.embedding, example_count=excluded.example_count",
+            params![speaker_id, serde_json::to_string(&prototype)?, usable as i64],
+        )?;
+        trained += 1;
+    }
+    if trained == 0 {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE speaker_training_examples SET trained=1 WHERE speaker_id IS NOT NULL",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO speaker_learning_state (id,last_trained_at) VALUES (1,?1) ON CONFLICT(id) DO UPDATE SET last_trained_at=excluded.last_trained_at",
+        [now.to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 /// Forget enrolled voices, or dismiss unknown turns from the browser. History is preserved.
 pub fn delete(paths: &Paths, ids: &[String]) -> Result<()> {
     let mut connection = connection(paths)?;
@@ -268,9 +469,15 @@ pub fn delete(paths: &Paths, ids: &[String]) -> Result<()> {
                 "INSERT OR IGNORE INTO dismissed_speaker_turns VALUES (?1)",
                 [id],
             )?;
+            tx.execute("DELETE FROM speaker_training_examples WHERE id=?1", [id])?;
         } else {
             let id = uuid::Uuid::parse_str(id)?.to_string();
             tx.execute("DELETE FROM speaker_embeddings WHERE speaker_id=?1", [&id])?;
+            tx.execute(
+                "DELETE FROM speaker_training_examples WHERE speaker_id=?1",
+                [&id],
+            )?;
+            tx.execute("DELETE FROM speaker_prototypes WHERE speaker_id=?1", [&id])?;
             tx.execute("DELETE FROM speaker_aliases WHERE speaker_id=?1", [&id])?;
             if tx.execute("DELETE FROM speakers WHERE id=?1", [&id])? == 0 {
                 bail!("Speaker not found");
@@ -355,6 +562,8 @@ fn normalized(values: &[f32]) -> Result<Vec<f32>> {
 
 /// Register a new voice only when there is no plausible existing match. A close
 /// competition remains Unknown rather than merging people or inventing profiles.
+/// The async-trained personalized head is an additional, stricter candidate:
+/// only a strong centroid match can affect attribution.
 pub fn identify(
     paths: &Paths,
     embedding: &[f32],
@@ -366,9 +575,12 @@ pub fn identify(
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut candidates: Vec<(f32, Speaker)> = Vec::new();
     {
-        let mut statement = tx.prepare("SELECT s.document, e.embedding FROM speakers s JOIN (
-            SELECT id AS speaker_id, embedding FROM speakers UNION ALL SELECT speaker_id, embedding FROM speaker_embeddings
-        ) e ON s.id=e.speaker_id")?;
+        let mut statement = tx.prepare(
+            "SELECT s.document, e.embedding FROM speakers s JOIN (
+            SELECT id AS speaker_id, embedding FROM speakers
+            UNION ALL SELECT speaker_id, embedding FROM speaker_embeddings
+        ) e ON s.id=e.speaker_id",
+        )?;
         for row in statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })? {
@@ -379,6 +591,40 @@ pub fn identify(
             }
             let vector = normalized(&vector)?;
             let score: f32 = vector.iter().zip(&embedding).map(|(a, b)| a * b).sum();
+            let speaker = serde_json::from_str::<Speaker>(&document)?;
+            if let Some((best, _)) = candidates
+                .iter_mut()
+                .find(|(_, existing)| existing.id == speaker.id)
+            {
+                *best = best.max(score);
+            } else {
+                candidates.push((score, speaker));
+            }
+        }
+    }
+    // These persisted class weights are rebuilt by contextd's background
+    // learner. Use a stricter floor than the exemplar matcher: a prototype
+    // averages confirmed variants and must be especially clear before it can
+    // claim an identity. The normal runner-up margin still applies below.
+    {
+        let model_threshold = settings.speaker_match_threshold.max(0.82);
+        let mut statement = tx.prepare(
+            "SELECT s.document, p.embedding FROM speaker_prototypes p
+             JOIN speakers s ON s.id=p.speaker_id",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (document, vector) = row?;
+            let vector: Vec<f32> = serde_json::from_str(&vector)?;
+            if vector.len() != embedding.len() {
+                continue;
+            }
+            let vector = normalized(&vector)?;
+            let score: f32 = vector.iter().zip(&embedding).map(|(a, b)| a * b).sum();
+            if score < model_threshold {
+                continue;
+            }
             let speaker = serde_json::from_str::<Speaker>(&document)?;
             if let Some((best, _)) = candidates
                 .iter_mut()
@@ -686,7 +932,69 @@ mod tests {
                 .collect(),
         };
         history.insert(&entry).unwrap();
-        link(&paths, &settings, &second.id, &first.id).unwrap();
+        // A daily inference job must not make linking wait for its file lock.
+        // The identity commits first, and the durable outbox retries the files.
+        std::fs::create_dir_all(paths.root.join("structured")).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(paths.root.join("structured/.write.lock"))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_paths = paths.clone();
+        let worker_settings = settings.clone();
+        let source = second.id.clone();
+        let target = first.id.clone();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(link(&worker_paths, &worker_settings, &source, &target))
+                .unwrap();
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        lock.unlock().unwrap();
+        worker.join().unwrap();
+        assert!(result
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("Link saved"));
+        let queued: usize = connection(&paths)
+            .unwrap()
+            .query_row("SELECT count(*) FROM speaker_sync", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(queued, 1);
+        sync_names(&paths, &settings).unwrap();
+        let queued: usize = connection(&paths)
+            .unwrap()
+            .query_row("SELECT count(*) FROM speaker_sync", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(queued, 0);
+        // Source-note contention must also leave the outbox retryable.
+        let note_lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(paths.root.join("notes/.write.lock"))
+            .unwrap();
+        note_lock.lock_exclusive().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_paths = paths.clone();
+        let worker_settings = settings.clone();
+        let target = first.id.clone();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(rename(&worker_paths, &worker_settings, &target, "Golden"))
+                .unwrap();
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        note_lock.unlock().unwrap();
+        worker.join().unwrap();
+        assert!(result
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("Speaker name saved"));
+        sync_names(&paths, &settings).unwrap();
         assert_eq!(list(&paths).unwrap().len(), 1);
         assert_eq!(
             identify(&paths, &[0.0, 1.0], &clip, &settings)

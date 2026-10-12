@@ -129,6 +129,30 @@ impl Service {
             return;
         }
         let weak = Arc::downgrade(self);
+        let learning_weak = weak.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10 * 60)).await;
+                let Some(service) = learning_weak.upgrade() else {
+                    break;
+                };
+                let paths = service.paths.clone();
+                match tokio::task::spawn_blocking(move || speakers::train_profiles_if_due(&paths))
+                    .await
+                {
+                    Ok(Ok(true)) => service.activity(
+                        "Speaker matching weights retrained from confirmed links; future scans will use the updated local model",
+                    ),
+                    Ok(Ok(false)) => {}
+                    Ok(Err(error)) => service.activity(format!(
+                        "Speaker learning will retry after an error: {error:#}"
+                    )),
+                    Err(error) => service.activity(format!(
+                        "Speaker learning task stopped and will retry: {error}"
+                    )),
+                }
+            }
+        });
         tokio::spawn(async move {
             let mut startup = true;
             loop {
@@ -350,7 +374,7 @@ impl Service {
         settings: Settings,
         raw: &str,
         refined: &str,
-    ) -> Result<(Vec<speakers::SpeakerTurn>, bool)> {
+    ) -> Result<(Vec<speakers::SpeakerTurn>, Vec<Option<Vec<f32>>>, bool)> {
         let engine = self.speaker_engine.clone();
         let paths = self.paths.clone();
         let opts = settings.clone();
@@ -365,7 +389,9 @@ impl Service {
             .collect();
         let mut new_speaker_detected = false;
         let mut identities = std::collections::HashMap::new();
+        let mut embeddings = std::collections::HashMap::new();
         for voice in detection.voices {
+            embeddings.insert(voice.local_speaker, voice.embedding.clone());
             let mut clip = Vec::new();
             for range in voice.ranges {
                 let start = (range[0].max(0.0) * 16000.0) as usize;
@@ -407,10 +433,15 @@ impl Service {
                     refined: refined.into(),
                     overlap: false,
                 }],
+                vec![locals
+                    .iter()
+                    .next()
+                    .and_then(|local| embeddings.get(local).cloned())],
                 new_speaker_detected,
             ));
         }
         let mut turns = Vec::new();
+        let mut turn_embeddings = Vec::new();
         for turn in &detection.turns {
             let start = ((turn.start * 16000.0) as usize).min(samples.len());
             let end = ((turn.end * 16000.0) as usize).min(samples.len());
@@ -456,8 +487,13 @@ impl Service {
                 refined: saved,
                 overlap,
             });
+            turn_embeddings.push(if overlap {
+                None
+            } else {
+                embeddings.get(&turn.local_speaker).cloned()
+            });
         }
-        Ok((turns, new_speaker_detected))
+        Ok((turns, turn_embeddings, new_speaker_detected))
     }
 
     async fn process_at(
@@ -551,7 +587,7 @@ impl Service {
             ));
             return Ok(None);
         }
-        let (speaker_turns, speaker_error, new_speaker_detected) = if settings
+        let (speaker_turns, training_embeddings, speaker_error, new_speaker_detected) = if settings
             .speaker_detection_enabled
         {
             self.activity(format!("Segment {id}: detecting speakers locally"));
@@ -559,17 +595,19 @@ impl Service {
                 .detect_speakers(samples.clone(), settings.clone(), &raw, &refined)
                 .await
             {
-                Ok((turns, new_speaker_detected)) => (turns, None, new_speaker_detected),
+                Ok((turns, embeddings, new_speaker_detected)) => {
+                    (turns, embeddings, None, new_speaker_detected)
+                }
                 Err(error) => {
                     let message = format!("Speaker detection failed; complete transcript saved without attribution: {error:#}");
                     let _ = self.events.send(Event::Error {
                         message: message.clone(),
                     });
-                    (Vec::new(), Some(message), false)
+                    (Vec::new(), Vec::new(), Some(message), false)
                 }
             }
         } else {
-            (Vec::new(), None, false)
+            (Vec::new(), Vec::new(), None, false)
         };
         // Queued recording jobs remain recoverable until this entire operation succeeds.
         // Save original and cleaned text together after the model decides what remains.
@@ -600,6 +638,16 @@ impl Service {
             filter_error,
         };
         history::History::open(&self.paths)?.insert(&entry)?;
+        if let Err(error) = speakers::store_unlabeled_examples(
+            &self.paths,
+            &entry.id,
+            &entry.speaker_turns,
+            &training_embeddings,
+        ) {
+            let _ = self.events.send(Event::Error {
+                message: format!("Speaker correction was saved, but its voice example could not be stored: {error:#}"),
+            });
+        }
         speakers::resolve_names(&speakers::connection(&self.paths)?, &mut entry)?;
         self.log_processed(&entry);
         let _ = self.events.send(Event::Transcript {

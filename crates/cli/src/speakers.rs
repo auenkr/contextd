@@ -13,6 +13,7 @@ use rodio::{Decoder, OutputStream, Sink, Source};
 use std::{
     fs::File,
     io::{self, BufReader, IsTerminal},
+    sync::mpsc::{self, Receiver, TryRecvError},
     time::Duration,
 };
 
@@ -25,6 +26,24 @@ impl Drop for Restore {
 struct Playback {
     _stream: OutputStream,
     sink: Sink,
+}
+
+// Never run history rewrites or file synchronization on the terminal thread.
+// Dropping the receiver on exit does not wait for the worker.
+fn background_edit(
+    operation: impl FnOnce() -> Result<String> + Send + 'static,
+) -> Receiver<Result<String>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(operation());
+    });
+    receiver
+}
+
+fn profiles(paths: &Paths) -> Result<Vec<speakers::Speaker>> {
+    let mut profiles = speakers::list(paths)?;
+    profiles.extend(speakers::unknown_turns(paths)?);
+    Ok(profiles)
 }
 
 pub fn run(paths: Paths) -> Result<()> {
@@ -41,9 +60,27 @@ pub fn run(paths: Paths) -> Result<()> {
     let mut deleting: Option<Vec<String>> = None;
     let mut message = String::new();
     let mut playback: Option<Playback> = None;
+    let mut pending: Option<Receiver<Result<String>>> = None;
+    let mut profiles = profiles(&paths)?;
     loop {
-        let mut profiles = speakers::list(&paths)?;
-        profiles.extend(speakers::unknown_turns(&paths)?);
+        if let Some(worker) = &pending {
+            match worker.try_recv() {
+                Ok(result) => {
+                    message = match result {
+                        Ok(message) => message,
+                        Err(error) => format!("{error:#}"),
+                    };
+                    pending = None;
+                    // Even a sync failure may have committed the identity change.
+                    profiles = self::profiles(&paths)?;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    pending = None;
+                    message = "Speaker update worker stopped; reopen Speakers to refresh".into();
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         let selected = selection
             .selected()
             .unwrap_or(0)
@@ -104,6 +141,9 @@ pub fn run(paths: Paths) -> Result<()> {
         if key.kind == KeyEventKind::Release {
             continue;
         }
+        if pending.is_some() && !matches!(key.code, KeyCode::Char('q' | ' ' | 's') | KeyCode::Esc) {
+            continue;
+        }
         if let Some(ids) = &deleting {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('n') => deleting = None,
@@ -113,6 +153,7 @@ pub fn run(paths: Paths) -> Result<()> {
                         Ok(()) => {
                             message = format!("Deleted {} entry(s)", ids.len());
                             deleting = None;
+                            profiles = self::profiles(&paths)?;
                         }
                         Err(error) => message = format!("{error:#}"),
                     }
@@ -130,13 +171,15 @@ pub fn run(paths: Paths) -> Result<()> {
                 KeyCode::Up | KeyCode::Char('k') => linking = Some(index.saturating_sub(1)),
                 KeyCode::Enter => {
                     if let (Some(source), Some(target)) = (profile, targets.get(index)) {
-                        match speakers::link(&paths, &paths.load()?, &source.id, &target.id) {
-                            Ok(()) => {
-                                message = format!("Linked to {} · notes synchronized", target.name);
-                                linking = None;
-                            }
-                            Err(error) => message = format!("{error:#}"),
-                        }
+                        let paths = paths.clone();
+                        let source = source.id.clone();
+                        let target = (*target).clone();
+                        pending = Some(background_edit(move || {
+                            speakers::link(&paths, &paths.load()?, &source, &target.id)?;
+                            Ok(format!("Linked to {} · notes synchronized", target.name))
+                        }));
+                        message = "Linking speaker and synchronizing notes… · q/Esc: back".into();
+                        linking = None;
                     }
                 }
                 _ => {}
@@ -154,15 +197,15 @@ pub fn run(paths: Paths) -> Result<()> {
                 }
                 KeyCode::Enter => {
                     if let Some(profile) = profile {
-                        match speakers::rename(&paths, &paths.load()?, &profile.id, name) {
-                            Ok(()) => {
-                                message =
-                                    "Name saved · earlier notes and future matches are in sync"
-                                        .into();
-                                editing = None;
-                            }
-                            Err(error) => message = format!("{error:#}"),
-                        }
+                        let paths = paths.clone();
+                        let id = profile.id.clone();
+                        let name = name.clone();
+                        pending = Some(background_edit(move || {
+                            speakers::rename(&paths, &paths.load()?, &id, &name)?;
+                            Ok("Name saved · earlier notes and future matches are in sync".into())
+                        }));
+                        message = "Saving speaker and synchronizing notes… · q/Esc: back".into();
+                        editing = None;
                     }
                 }
                 _ => {}
@@ -269,5 +312,23 @@ pub fn run(paths: Paths) -> Result<()> {
             KeyCode::Char('s') => playback = None,
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speaker_edit_does_not_block_input_or_wait_on_exit() {
+        let (release, wait) = mpsc::channel();
+        let worker = background_edit(move || {
+            wait.recv()?;
+            Ok("Saved".into())
+        });
+        assert!(matches!(worker.try_recv(), Err(TryRecvError::Empty)));
+        // Closing the browser is safe while synchronization is still running.
+        drop(worker);
+        release.send(()).unwrap();
     }
 }

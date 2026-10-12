@@ -115,7 +115,47 @@ fn recognize(
         stream.finalize()?;
         Ok(stream.snapshot())
     } else {
-        Ok(session.run(samples, options)?)
+        match session.run(samples, options) {
+            Ok(transcript) => Ok(transcript),
+            Err(
+                error @ (transcribe_cpp::Error::OutputTruncated { .. }
+                | transcribe_cpp::Error::OutputRepetition { .. }),
+            ) => {
+                // Qwen3-ASR occasionally fills its decoder budget even for a
+                // short clip (usually because it starts repeating). Retrying
+                // the same persisted job would fail forever. Split it into
+                // overlapping pieces and decode each independently instead.
+                const MIN_SPLIT_SAMPLES: usize = 2 * 16000;
+                const OVERLAP_SAMPLES: usize = 4000;
+                if samples.len() <= MIN_SPLIT_SAMPLES {
+                    let fallback_error = error.to_string();
+                    let partial = match error {
+                        transcribe_cpp::Error::OutputTruncated { partial, .. }
+                        | transcribe_cpp::Error::OutputRepetition { partial, .. } => partial,
+                        _ => None,
+                    };
+                    return partial
+                        .map(|value| *value)
+                        .ok_or_else(|| anyhow::anyhow!(fallback_error));
+                }
+                let midpoint = samples.len() / 2;
+                let left_end = (midpoint + OVERLAP_SAMPLES).min(samples.len());
+                let right_start = midpoint.saturating_sub(OVERLAP_SAMPLES);
+                let left = recognize(session, &samples[..left_end], options, false)?;
+                let right = recognize(session, &samples[right_start..], options, false)?;
+                let text = [left.text.trim(), right.text.trim()]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Ok(transcribe_cpp::Transcript {
+                    text,
+                    language: left.language.or(right.language),
+                    ..Default::default()
+                })
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 

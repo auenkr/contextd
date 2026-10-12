@@ -250,12 +250,12 @@ impl History {
     }
     /// Atomic Markdown replacement under a cross-process lock.
     pub fn sync_day(&self, created_at: &str) -> Result<()> {
-        self.sync_day_inner(created_at, true)
+        self.sync_day_inner(created_at, true, true)
     }
-    pub(crate) fn sync_day_preserving_structure(&self, created_at: &str) -> Result<()> {
-        self.sync_day_inner(created_at, false)
+    pub(crate) fn try_sync_day(&self, created_at: &str, invalidate: bool) -> Result<()> {
+        self.sync_day_inner(created_at, invalidate, false)
     }
-    fn sync_day_inner(&self, created_at: &str, invalidate: bool) -> Result<()> {
+    fn sync_day_inner(&self, created_at: &str, invalidate: bool, wait: bool) -> Result<()> {
         use fs2::FileExt;
         let day = chrono::DateTime::parse_from_rfc3339(created_at)?
             .with_timezone(&chrono::Local)
@@ -267,7 +267,12 @@ impl History {
             .read(true)
             .write(true)
             .open(directory.join(".write.lock"))?;
-        lock.lock_exclusive()?;
+        if wait {
+            lock.lock_exclusive()?;
+        } else {
+            lock.try_lock_exclusive()
+                .context("Note synchronization is busy; speaker changes remain queued")?;
+        }
         // A UTC window covering every local timezone bounds the scan to three
         // days. Filter exact local dates below; avoid rereading years of memory.
         let lower = day.and_hms_opt(0, 0, 0).unwrap().and_utc() - chrono::Duration::days(1);
