@@ -2,6 +2,8 @@
 
 Speaker detection is enabled by default. Open **Speakers** from the dashboard or run `contextd speakers`. Select a voice, press Enter to play its sample, and press `n` to name it. Press `l` to link a duplicate or an unknown turn to an existing speaker. Select the target and press Enter. Linked profiles retain all confirmed voice embeddings for future matching; earlier notes and search use the target identity. Unknown turns are corrected individually and do not enroll a voice without an embedding. Names appear in past notes and are reused for future matching recordings.
 
+Press `d` (or Delete) to delete the selected entry, or `D` to delete all unnamed profiles and unknown entries. Confirm with `y`; Escape cancels. Deletion preserves transcripts and earlier speaker names. Deleted voices no longer participate in matching; future speech may enroll them again. Unknown entries are hidden from the listing.
+
 ## Previous and new processing
 
 | Stage | Previous processing | New processing |

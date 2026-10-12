@@ -101,6 +101,8 @@ Search returns JSON with matching notes, IDs, timestamps, and model provenance. 
 | Export JSON | `contextd export --format json > memory.json` |
 | Delete a saved note | `contextd delete <memory-id>` |
 
+The dashboard’s top-right CPU and RAM graphs show the last 60 seconds, sampled once per second, including child model workers. RAM shows current resident memory in MiB and the session peak, so loading and unloading models can be compared. This measures process memory, not exact model size or minimum system RAM; shared pages may be counted more than once. The horizontal axes show seconds before now; vertical axes show CPU percent and RAM MiB. CPU uses 100% per busy core. Download panels retain the completed result as **Downloaded · ready to use**, show **finalizing** until installation finishes, and display failures explicitly.
+
 Use `contextd --help` or `contextd <command> --help` for options. Stop capture before changing settings through a separate CLI process. In the dashboard, **Config** pauses recording and resumes it when you return; **Explore notes** keeps recording running.
 
 ## Choose your language and inputs

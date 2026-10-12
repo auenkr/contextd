@@ -20,3 +20,4 @@ crossterm = "0.28"
 rodio = { version = "0.20", default-features = false, features = ["wav"] }
 unicode-segmentation = "1"
 unicode-width = "0.2"
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }

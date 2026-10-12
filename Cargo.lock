@@ -433,6 +433,7 @@ dependencies = [
  "ratatui",
  "rodio",
  "serde_json",
+ "sysinfo",
  "tokio",
  "unicode-segmentation",
  "unicode-width 0.2.0",

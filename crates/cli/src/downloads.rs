@@ -29,9 +29,46 @@ struct Registry {
 pub struct Progress {
     pub completed: u64,
     pub total: u64,
+    pub finished: bool,
+    pub error: Option<String>,
 }
 
 impl Progress {
+    pub fn ratio(&self) -> f64 {
+        if self.finished && self.error.is_none() {
+            1.0
+        } else {
+            (self.percent() / 100.0).clamp(0.0, 1.0)
+        }
+    }
+    pub fn title(&self) -> &'static str {
+        if self.error.is_some() {
+            "Download failed"
+        } else if self.finished {
+            "Downloaded"
+        } else {
+            "Downloading"
+        }
+    }
+    pub fn label(&self, id: &str, queued: bool) -> String {
+        if let Some(error) = &self.error {
+            format!("{id}: failed · {error}")
+        } else if self.finished {
+            format!("{id}: downloaded · ready to use")
+        } else if queued {
+            format!("{id}: waiting for a free download slot")
+        } else if self.total > 0 && self.completed >= self.total {
+            format!("{id}: 100% · finalizing download…")
+        } else {
+            format!(
+                "{id}: {:.0}% · {:.1} / {:.1} MB",
+                self.percent(),
+                self.completed as f64 / 1e6,
+                self.total as f64 / 1e6
+            )
+        }
+    }
+
     /// Whole percent of a known-size transfer, zero when the length is unknown.
     pub fn percent(&self) -> f64 {
         if self.total == 0 {
@@ -53,6 +90,16 @@ struct Inner {
     registry: Mutex<Registry>,
     /// Newest byte counts per model, so every screen reports identical progress.
     progress: Mutex<HashMap<String, Progress>>,
+}
+
+async fn next_event(events: &mut tokio::sync::broadcast::Receiver<Event>) -> Option<Event> {
+    loop {
+        match events.recv().await {
+            Ok(event) => return Some(event),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        }
+    }
 }
 
 impl Downloads {
@@ -78,19 +125,21 @@ impl Downloads {
         let downloads = self.clone();
         let mut events = self.inner.service.events.subscribe();
         self.inner.runtime.spawn(async move {
-            while let Ok(event) = events.recv().await {
+            while let Some(event) = next_event(&mut events).await {
                 if let Event::Download {
                     id,
                     completed,
                     total,
                 } = event
                 {
-                    downloads
-                        .inner
-                        .progress
-                        .lock()
-                        .unwrap()
-                        .insert(id, Progress { completed, total });
+                    downloads.inner.progress.lock().unwrap().insert(
+                        id,
+                        Progress {
+                            completed,
+                            total,
+                            ..Progress::default()
+                        },
+                    );
                 }
             }
         });
@@ -111,14 +160,21 @@ impl Downloads {
             .chain(registry.entries.keys().cloned())
             .collect();
         let mut seen = std::collections::HashSet::new();
-        ordered
+        let mut snapshot: Vec<_> = ordered
             .into_iter()
             .filter(|id| seen.insert(id.clone()))
             .map(|id| {
-                let bytes = progress.get(&id).cloned().unwrap_or_default();
+                let mut bytes = progress.get(&id).cloned().unwrap_or_default();
+                if let Some(entry) = registry.entries.get(&id) {
+                    let outcome = entry.progress.borrow();
+                    bytes.finished = outcome.finished;
+                    bytes.error = outcome.error.clone();
+                }
                 (id, bytes)
             })
-            .collect()
+            .collect();
+        snapshot.sort_by(|a, b| a.1.finished.cmp(&b.1.finished).then(a.0.cmp(&b.0)));
+        snapshot
     }
 
     pub fn queued(&self, id: &str) -> bool {
@@ -142,7 +198,15 @@ impl Downloads {
             return;
         }
         {
-            let registry = self.inner.registry.lock().unwrap();
+            let mut registry = self.inner.registry.lock().unwrap();
+            if registry
+                .entries
+                .get(&id)
+                .is_some_and(|entry| entry.progress.borrow().finished)
+            {
+                registry.entries.remove(&id);
+                self.inner.progress.lock().unwrap().remove(&id);
+            }
             if registry.entries.contains_key(&id) || registry.waiting.contains(&id) {
                 return;
             }
@@ -243,7 +307,9 @@ impl Downloads {
             registry.waiting.retain(|queued| queued != &id);
             if let Some(entry) = registry.entries.remove(&id) {
                 entry.task.abort();
-                registry.running = registry.running.saturating_sub(1);
+                if !entry.progress.borrow().finished {
+                    registry.running = registry.running.saturating_sub(1);
+                }
             }
         }
         let _ = models::remove_partial(self.paths(), &id);
@@ -274,5 +340,59 @@ impl Downloads {
     pub fn any_active(&self) -> bool {
         let registry = self.inner.registry.lock().unwrap();
         registry.running > 0 || !registry.waiting.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn progress_listener_survives_lag_and_tracks_later_downloads() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
+        for completed in 0..3 {
+            sender
+                .send(Event::Download {
+                    id: "test".into(),
+                    completed,
+                    total: 3,
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            next_event(&mut receiver).await,
+            Some(Event::Download { completed: 2, .. })
+        ));
+        sender
+            .send(Event::Download {
+                id: "next".into(),
+                completed: 1,
+                total: 5,
+            })
+            .unwrap();
+        assert!(
+            matches!(next_event(&mut receiver).await, Some(Event::Download { id, .. }) if id == "next")
+        );
+    }
+
+    #[test]
+    fn full_transfer_is_not_installed_until_download_finishes() {
+        let mut progress = Progress {
+            completed: 100,
+            total: 100,
+            ..Progress::default()
+        };
+        assert_eq!(progress.title(), "Downloading");
+        assert!(progress.label("test", false).contains("finalizing"));
+        progress.finished = true;
+        assert_eq!(progress.title(), "Downloaded");
+        progress.completed = 0;
+        assert_eq!(progress.ratio(), 1.0);
+        assert_eq!(
+            progress.label("test", false),
+            "test: downloaded · ready to use"
+        );
+        progress.error = Some("disk full".into());
+        assert_eq!(progress.title(), "Download failed");
+        assert!(progress.label("test", false).contains("disk full"));
     }
 }

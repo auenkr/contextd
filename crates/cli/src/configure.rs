@@ -656,22 +656,16 @@ pub fn run(
                  .style(Style::default().fg(ACCENT)).block(panel(" Quick controls ")), rows[3]);
             let progress = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(rows[4]);
             if let Some((id, first)) = active.first() {
-                let ratio = if first.total == 0 { 0.0 } else { (first.completed as f64 / first.total as f64).min(1.0) };
+                let ratio = first.ratio();
                 let queued = downloads.queued(id);
                 frame.render_widget(Gauge::default().ratio(ratio).gauge_style(Style::default().fg(Color::Cyan))
-                    .label(if queued { format!("{id}: waiting for a free download slot") } else {
-                        format!("{id}: {:.0}% · {:.1} / {:.1} MB · q: cancel and go back", ratio * 100.0, first.completed as f64 / 1e6, first.total as f64 / 1e6)
-                    })
-                     .block(panel(if active.len() > 1 { format!(" Downloading ({} in queue) ", active.len()) } else { " Downloading ".into() })), progress[0]);
+                    .label(first.label(id, queued))
+                    .block(panel(format!(" {} {id} ", first.title()))), progress[0]);
             }
             frame.render_widget(
                 Paragraph::new(
                     active.iter().skip(1).map(|(id, progress)| {
-                        if downloads.queued(id) {
-                            format!("{id}: waiting for a free slot")
-                        } else {
-                            format!("{id}: {:.0}% · {:.1} / {:.1} MB", progress.percent(), progress.completed as f64 / 1e6, progress.total as f64 / 1e6)
-                        }
+                        progress.label(id, downloads.queued(id))
                     }).collect::<Vec<_>>().join("\n"),
                 )
                 .wrap(Wrap { trim: false })

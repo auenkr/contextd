@@ -38,6 +38,7 @@ pub fn run(paths: Paths) -> Result<()> {
     let mut selection = ListState::default().with_selected(Some(0));
     let mut editing: Option<String> = None;
     let mut linking: Option<usize> = None;
+    let mut deleting: Option<Vec<String>> = None;
     let mut message = String::new();
     let mut playback: Option<Playback> = None;
     loop {
@@ -61,23 +62,28 @@ pub fn run(paths: Paths) -> Result<()> {
             let columns = Layout::horizontal([Constraint::Percentage(38),Constraint::Percentage(62)]).split(rows[1]);
             let items: Vec<_> = profiles.iter().map(|speaker| ListItem::new(vec![
                 Line::from(speaker.name.clone()),
-                Line::styled(if speaker.named { "Named voice" } else { "New voice · name needed" },Style::default().fg(tui::MUTED)),
+                Line::styled(if speaker.named { "Named voice" } else { "Unnamed / unknown" },Style::default().fg(tui::MUTED)),
             ])).collect();
             frame.render_stateful_widget(List::new(items).block(tui::panel(" Saved voices "))
                 .highlight_style(Style::default().bg(tui::SELECTED).fg(tui::ACCENT)).highlight_symbol("› "),columns[0],&mut selection);
-            let detail = profile.map(|speaker| format!("{}\n\n{}\n\nSample: {:.1} seconds\n{}\n\nEnter: listen to this voice\nn: set or change the name\nl: link to an existing speaker\n\nNaming updates earlier notes and future voice matches. Voice samples are kept separately from full recordings.",speaker.name,
+            let detail = profile.map(|speaker| format!("{}\n\n{}\n\nSample: {:.1} seconds\n{}\n\nEnter: listen to this voice\nn: set or change the name\nl: link to an existing speaker\nd: delete this entry · D: delete all unnamed\n\nNaming updates earlier notes and future voice matches. Voice samples are kept separately from full recordings.",speaker.name,
                 if speaker.named { "This voice is named." } else { "Listen, then enter the person's name." }, speaker.sample_seconds,speaker.sample_path))
                 .unwrap_or_else(|| "No speakers yet.\n\nEnable Speaker detection in Config and record speech. A new clear voice gets a short saved sample; very brief or overlapping speech stays unknown.".into());
             frame.render_widget(Paragraph::new(detail).wrap(Wrap { trim:false }).block(tui::panel(" Identify the speaker ")),columns[1]);
             let playing = playback.as_ref().is_some_and(|p| !p.sink.empty());
             frame.render_widget(Paragraph::new(format!("{}{}",if playing { "Playing sample · " } else { "" },message)),rows[2]);
-            frame.render_widget(Paragraph::new("↑/↓ j/k: select · Enter: listen · Space: pause/resume · s: stop · n: name · l: link · q/Esc: back").style(Style::default().fg(tui::MUTED)),rows[3]);
+            frame.render_widget(Paragraph::new("↑/↓ j/k: select · Enter: listen · Space: pause/resume · s: stop · n: name · l: link · d: delete · D: delete unnamed · q/Esc: back").style(Style::default().fg(tui::MUTED)),rows[3]);
             if let Some(index) = linking {
                 let area = tui::centered(frame.area(), (70, 18));
                 frame.render_widget(Clear, area);
                 let items: Vec<_> = targets.iter().map(|p| ListItem::new(p.name.clone())).collect();
                 let mut state = ListState::default().with_selected(Some(index));
                 frame.render_stateful_widget(List::new(items).block(tui::panel(" Link to speaker · ↑/↓ select · Enter save · Esc cancel ")).highlight_style(Style::default().bg(tui::SELECTED).fg(tui::ACCENT)).highlight_symbol("› "), area, &mut state);
+            }
+            if let Some(ids) = &deleting {
+                let area = tui::centered(frame.area(), (65, 9));
+                frame.render_widget(Clear, area);
+                frame.render_widget(Paragraph::new(format!("Delete {} speaker entry(s)?\n\nSaved voices will no longer be matched.\nUnknown entries will leave this list.\nRecorded text and earlier names are preserved.\n\ny: delete · Esc: cancel", ids.len())).block(tui::panel(" Delete speaker ")), area);
             }
             if let Some(name) = &editing {
                 let area = tui::centered(frame.area(),(65,9));
@@ -94,6 +100,23 @@ pub fn run(paths: Paths) -> Result<()> {
             continue;
         };
         if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        if let Some(ids) = &deleting {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('n') => deleting = None,
+                KeyCode::Char('y') => {
+                    playback = None;
+                    match speakers::delete(&paths, ids) {
+                        Ok(()) => {
+                            message = format!("Deleted {} entry(s)", ids.len());
+                            deleting = None;
+                        }
+                        Err(error) => message = format!("{error:#}"),
+                    }
+                }
+                _ => {}
+            }
             continue;
         }
         if let Some(index) = linking {
@@ -150,6 +173,21 @@ pub fn run(paths: Paths) -> Result<()> {
                 selection.select(Some((selected + 1).min(profiles.len().saturating_sub(1))))
             }
             KeyCode::Up | KeyCode::Char('k') => selection.select(Some(selected.saturating_sub(1))),
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if let Some(profile) = profile {
+                    deleting = Some(vec![profile.id.clone()]);
+                }
+            }
+            KeyCode::Char('D') => {
+                let ids: Vec<_> = profiles
+                    .iter()
+                    .filter(|p| !p.named)
+                    .map(|p| p.id.clone())
+                    .collect();
+                if !ids.is_empty() {
+                    deleting = Some(ids);
+                }
+            }
             KeyCode::Char('l') => {
                 if profile.is_some() && !targets.is_empty() {
                     linking = Some(0);

@@ -6,14 +6,151 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Gauge, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Axis, Block, Chart, Dataset, Gauge, GraphType, List, ListItem, ListState, Paragraph, Wrap,
+    },
 };
 use std::{
     collections::VecDeque,
     io::{self, IsTerminal},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+/// Process-tree resident memory includes the model workers, not the whole machine.
+struct Usage {
+    system: sysinfo::System,
+    last: Instant,
+    cpu: VecDeque<u64>,
+    memory: VecDeque<u64>,
+    peak: u64,
+}
+impl Usage {
+    fn new() -> Self {
+        let mut value = Self {
+            system: sysinfo::System::new(),
+            last: Instant::now(),
+            cpu: VecDeque::new(),
+            memory: VecDeque::new(),
+            peak: 0,
+        };
+        value.refresh();
+        value
+    }
+    fn refresh(&mut self) {
+        self.system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_memory(),
+        );
+        let mut pids =
+            std::collections::HashSet::from([sysinfo::Pid::from_u32(std::process::id())]);
+        loop {
+            let before = pids.len();
+            for (pid, process) in self.system.processes() {
+                if process
+                    .parent()
+                    .is_some_and(|parent| pids.contains(&parent))
+                {
+                    pids.insert(*pid);
+                }
+            }
+            if pids.len() == before {
+                break;
+            }
+        }
+        let mut cpu = 0.0f32;
+        let mut bytes = 0u64;
+        for pid in pids {
+            if let Some(process) = self.system.process(pid) {
+                cpu += process.cpu_usage();
+                bytes = bytes.saturating_add(process.memory());
+            }
+        }
+        let mib = bytes / (1024 * 1024);
+        self.peak = self.peak.max(mib);
+        self.cpu.push_back(cpu.round() as u64);
+        self.memory.push_back(mib);
+        if self.cpu.len() > 60 {
+            self.cpu.pop_front();
+            self.memory.pop_front();
+        }
+        self.last = Instant::now();
+    }
+    fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        let columns = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(area);
+        let cpu: Vec<_> = self
+            .cpu
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                (
+                    i as f64 - self.cpu.len().saturating_sub(1) as f64,
+                    *value as f64,
+                )
+            })
+            .collect();
+        let memory: Vec<_> = self
+            .memory
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                (
+                    i as f64 - self.memory.len().saturating_sub(1) as f64,
+                    *value as f64,
+                )
+            })
+            .collect();
+        let cpu_max = self.cpu.iter().copied().max().unwrap_or(100).max(100);
+        for (area, data, max, title, color, unit) in [
+            (
+                columns[0],
+                &cpu,
+                cpu_max,
+                format!(" CPU {}% ", self.cpu.back().unwrap_or(&0)),
+                Color::Cyan,
+                "%",
+            ),
+            (
+                columns[1],
+                &memory,
+                self.peak.max(1),
+                format!(
+                    " RAM {} MiB · peak {} ",
+                    self.memory.back().unwrap_or(&0),
+                    self.peak
+                ),
+                Color::Green,
+                "MiB",
+            ),
+        ] {
+            frame.render_widget(
+                Chart::new(vec![Dataset::default()
+                    .data(data)
+                    .graph_type(GraphType::Line)
+                    .marker(ratatui::symbols::Marker::Braille)
+                    .style(Style::default().fg(color))])
+                .block(tui::panel(title))
+                .x_axis(
+                    Axis::default()
+                        .bounds([-59.0, 0.0])
+                        .labels(["-59s", "-30s", "now"])
+                        .style(Style::default().fg(tui::MUTED)),
+                )
+                .y_axis(
+                    Axis::default()
+                        .bounds([0.0, max as f64])
+                        .labels(["0".to_string(), format!("{max}{unit}")])
+                        .style(Style::default().fg(tui::MUTED)),
+                ),
+                area,
+            );
+        }
+    }
+}
 
 struct RestoreTerminal;
 impl Drop for RestoreTerminal {
@@ -179,6 +316,7 @@ pub fn run(
     let mut logged_download = (String::new(), 101u64);
     let mut scroll = 0u16;
     let mut help = false;
+    let mut usage = Usage::new();
     log(
         &mut logs,
         Color::Cyan,
@@ -190,6 +328,9 @@ pub fn run(
         .into(),
     );
     loop {
+        if usage.last.elapsed() >= Duration::from_secs(1) {
+            usage.refresh();
+        }
         if shutdown.load(std::sync::atomic::Ordering::Relaxed)
             && !pending.as_ref().is_some_and(|p| matches!(p.job, Job::Exit))
         {
@@ -334,7 +475,7 @@ pub fn run(
         let action_count = actions.len().saturating_sub(1);
         let translation_warning = models::translation_warning(&settings);
         terminal.draw(|frame| {
-            let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(8), Constraint::Length(if translation_warning.is_some() { 7 } else { 4 }), Constraint::Length(1)]).split(frame.area());
+            let rows = Layout::vertical([Constraint::Length(7), Constraint::Min(8), Constraint::Length(if translation_warning.is_some() { 7 } else { 4 }), Constraint::Length(1)]).split(frame.area());
             let state = if downloads.any_active() {
                 "Downloading models"
             } else if setup {
@@ -347,7 +488,9 @@ pub fn run(
                 "Paused"
             };
             frame.render_widget(Block::default().style(Style::default().bg(tui::BACKGROUND)), frame.area());
-            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(" ◆ contextd ", Style::default().fg(tui::ACCENT).add_modifier(Modifier::BOLD)), Span::styled(format!("  {state}  ·  {}  ·  input {:.4}", if processing { "Processing speech" } else { "Waiting for speech" }, level), Style::default().fg(if recording { Color::Green } else { Color::Yellow }))])).block(tui::panel(" Local • private • on-device ")), rows[0]);
+            let header = Layout::horizontal([Constraint::Min(30), Constraint::Length(if rows[0].width >= 110 { 58 } else { rows[0].width / 2 })]).split(rows[0]);
+            usage.render(frame, header[1]);
+            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(" ◆ contextd ", Style::default().fg(tui::ACCENT).add_modifier(Modifier::BOLD)), Span::styled(format!("  {state}  ·  {}  ·  input {:.4}", if processing { "Processing speech" } else { "Waiting for speech" }, level), Style::default().fg(if recording { Color::Green } else { Color::Yellow }))])).block(tui::panel(" Local • private • on-device ")), header[0]);
             let columns = Layout::horizontal([Constraint::Length(26), Constraint::Min(20)]).split(rows[1]);
             frame.render_stateful_widget(List::new(actions.into_iter().map(ListItem::new).collect::<Vec<_>>()).highlight_symbol("› ").highlight_style(Style::default().fg(tui::ACCENT).bg(tui::SELECTED).add_modifier(Modifier::BOLD)).block(tui::panel(" Navigation ")), columns[0], &mut selection);
             if setup {
@@ -359,13 +502,11 @@ pub fn run(
                 frame.render_widget(paragraph.scroll((max.saturating_sub(scroll), 0)).block(tui::panel(" Live processing log ")), columns[1]);
             }
             if let Some((id, progress)) = downloads.snapshot().first() {
-                let ratio = (progress.percent() / 100.0).min(1.0);
+                let ratio = progress.ratio();
                 let queued = downloads.queued(id);
                 frame.render_widget(Gauge::default().ratio(ratio).gauge_style(Style::default().fg(Color::Cyan))
-                    .label(if queued { format!("{id}: waiting for a free download slot") } else {
-                        format!("{id}: {:.0}% · {:.1} / {:.1} MB · {}", progress.percent(), progress.completed as f64 / 1e6, progress.total as f64 / 1e6, if setup && !first_run { "Esc: cancel and go back" } else { "q: cancel and exit" })
-                    })
-                    .block(tui::panel(format!(" Downloading {id} "))), rows[2]);
+                    .label(progress.label(id, queued))
+                    .block(tui::panel(format!(" {} {id} ", progress.title()))), rows[2]);
             } else {
                 let mut processing_info = vec![Line::from(if setup { format!("Language: {} · v: auto / English / Hindi / Hindi + English", settings.language) } else { format!("Models: {} · language {} · cleanup {} · saved text {}", settings.speech_model, settings.language, if settings.filter_enabled { settings.filter_model.as_str() } else { "disabled" }, models::output_language_name(&settings.output_language)) })];
                 processing_info.push(Line::from(format!("Audio: {} microphone input(s) · device output {}", settings.selected_microphones().len(), if settings.record_device_audio { "on" } else { "off" })));
@@ -398,6 +539,10 @@ pub fn run(
                     tui::keys("PgUp / PgDn", "Scroll back and forward"),
                     tui::keys("Ctrl+u / Ctrl+d", "Scroll by ten lines"),
                     tui::keys("End", "Jump to the newest entries"),
+                    tui::section("Resource usage"),
+                    tui::keys("CPU / RAM graphs", "Last 60 seconds, sampled once per second; includes child workers"),
+                    tui::keys("CPU", "100% is one busy CPU core; multiple cores can exceed 100%"),
+                    tui::keys("RAM / peak", "Resident MiB now / highest since dashboard start; shared pages may be counted twice"),
                     tui::section("Other"),
                     tui::keys("q / Esc / Ctrl+C", "Stop recording and exit"),
                 ]);

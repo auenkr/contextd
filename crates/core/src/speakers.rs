@@ -55,6 +55,7 @@ pub fn connection(paths: &Paths) -> Result<Connection> {
         "CREATE TABLE IF NOT EXISTS speakers (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, named INTEGER NOT NULL,
         document TEXT NOT NULL, embedding TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS dismissed_speaker_turns (id TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS speaker_aliases (id TEXT PRIMARY KEY, speaker_id TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS speaker_embeddings (id TEXT PRIMARY KEY, speaker_id TEXT NOT NULL, embedding TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS speaker_sync (day TEXT NOT NULL, speaker_id TEXT NOT NULL, old_name TEXT NOT NULL, new_name TEXT NOT NULL, PRIMARY KEY(day,speaker_id));",
@@ -254,13 +255,47 @@ pub fn link(paths: &Paths, settings: &Settings, source: &str, target: &str) -> R
         .context("Link saved; note synchronization will retry on next app start")
 }
 
+/// Forget enrolled voices, or dismiss unknown turns from the browser. History is preserved.
+pub fn delete(paths: &Paths, ids: &[String]) -> Result<()> {
+    let mut connection = connection(paths)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    for id in ids {
+        if let Some(value) = id.strip_prefix("unknown:") {
+            let (transcript, index) = value.rsplit_once(':').context("Invalid unknown turn ID")?;
+            uuid::Uuid::parse_str(transcript)?;
+            let _: usize = index.parse()?;
+            tx.execute(
+                "INSERT OR IGNORE INTO dismissed_speaker_turns VALUES (?1)",
+                [id],
+            )?;
+        } else {
+            let id = uuid::Uuid::parse_str(id)?.to_string();
+            tx.execute("DELETE FROM speaker_embeddings WHERE speaker_id=?1", [&id])?;
+            tx.execute("DELETE FROM speaker_aliases WHERE speaker_id=?1", [&id])?;
+            if tx.execute("DELETE FROM speakers WHERE id=?1", [&id])? == 0 {
+                bail!("Speaker not found");
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Unknown turns can be selected and linked independently in the speaker browser.
 pub fn unknown_turns(paths: &Paths) -> Result<Vec<Speaker>> {
     let history = crate::history::History::open(paths)?;
+    let connection = connection(paths)?;
+    let dismissed: std::collections::HashSet<String> = {
+        let mut statement = connection.prepare("SELECT id FROM dismissed_speaker_turns")?;
+        let rows = statement.query_map([], |r| r.get(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
     let mut result = Vec::new();
     for entry in history.list(10000)? {
         for (index, turn) in entry.speaker_turns.iter().enumerate() {
-            if turn.speaker_id.is_none() {
+            if turn.speaker_id.is_none()
+                && !dismissed.contains(&format!("unknown:{}:{}", entry.id, index))
+            {
                 result.push(Speaker {
                     id: format!("unknown:{}:{}", entry.id, index),
                     name: format!(
@@ -587,6 +622,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deleting_voice_removes_linked_matching_vectors() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = Paths::in_directory(directory.path());
+        paths.ensure_dirs().unwrap();
+        let settings = Settings::default();
+        let clip = vec![0.1; 32000];
+        let first = identify(&paths, &[1.0, 0.0], &clip, &settings)
+            .unwrap()
+            .unwrap();
+        let second = identify(&paths, &[0.0, 1.0], &clip, &settings)
+            .unwrap()
+            .unwrap();
+        link(&paths, &settings, &second.id, &first.id).unwrap();
+        delete(&paths, &[first.id.clone()]).unwrap();
+        assert!(list(&paths).unwrap().is_empty());
+        let replacement = identify(&paths, &[0.0, 1.0], &clip, &settings)
+            .unwrap()
+            .unwrap();
+        assert_ne!(replacement.id, first.id);
+    }
+
+    #[test]
     fn linking_preserves_voice_variants_and_corrects_only_selected_unknown() {
         let directory = tempfile::tempdir().unwrap();
         let paths = Paths::in_directory(directory.path());
@@ -655,6 +712,15 @@ mod tests {
             Some(&first.id)
         );
         assert!(updated.speaker_turns[2].speaker_id.is_none());
+        let unknown_id = format!("unknown:{}:2", entry.id);
+        delete(&paths, &[unknown_id.clone()]).unwrap();
+        assert!(!unknown_turns(&paths)
+            .unwrap()
+            .iter()
+            .any(|s| s.id == unknown_id));
+        assert!(history.list(10).unwrap()[0].speaker_turns[2]
+            .speaker_id
+            .is_none());
         assert!(link(&paths, &settings, &first.id, &first.id).is_err());
         // An in-flight recording using the old identity resolves to its canonical speaker.
         let mut stale = entry.clone();
