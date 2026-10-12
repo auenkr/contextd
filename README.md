@@ -165,7 +165,7 @@ The API is read-only, disabled by default, and binds to loopback without authent
 
 ## Data and recording behavior
 
-Audio retention is off by default, but completed segments temporarily enter a disk-backed queue until processing succeeds. Failed jobs stay queued for retry. Optional speaker detection retains short voice samples even when full audio retention is off.
+Audio retention is off by default, but completed segments temporarily enter a disk-backed queue until processing succeeds. Failed jobs stay queued for retry. Speaker detection retains the full recording when it finds a new speaker or an unknown turn, regardless of the audio-retention setting, so those voices can be reviewed and linked later. It also keeps short enrolled voice samples separately.
 
 Notes and JSON logs contain transcript text. Deleting a note updates the index and daily files and removes its retained clip, but does not erase earlier log records or speaker samples. Model downloads contact upstream hosting services; model weights have their own licenses.
 
