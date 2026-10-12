@@ -77,7 +77,7 @@ Export the complete configuration before editing: omitted fields receive default
 | `cache_directory` | `null` | Absolute cache override, applied after restart. Existing weights are not moved. |
 | `logs_directory` | `null` | Absolute logs override, applied after restart. Config remains at its original location. |
 | `short_transcript_policy` | `cleanup` | Discard empty cleanup output; `skip_all` also skips every 1–3-word transcript, `keep` disables this check. |
-| `retain_audio` | `false` | Keep completed WAV clips in `audio/`. |
+| `retain_audio` | `false` | Keep completed WAV clips in `audio/`. Speaker detection also retains the full recording when it finds a new speaker or an unknown turn, even when this is `false`, so the speaker audio can be reviewed later. |
 | `speech_threshold` | `0.012` | RMS energy threshold, allowed range `0.001`–`0.2`. Lower it for quieter speech. |
 | `vad_threshold` | `0.6` | Embedded Silero speech-confidence threshold (`0.1`–`0.95`), in addition to minimum RMS. Sustained speech onset is required; loud noise alone is insufficient. |
 | `silence_ms` | `1400` | Pause that ends a segment, allowed range `300`–`5000` ms. |

@@ -1,7 +1,7 @@
 //! Listen to voice samples and name persistent speaker profiles.
 use crate::tui;
 use anyhow::{Context, Result};
-use contextd_core::{speakers, Paths};
+use contextd_core::{history::History, speakers, Paths};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::{Constraint, Layout},
@@ -9,7 +9,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
-use rodio::{Decoder, OutputStream, Sink};
+use rodio::{Decoder, OutputStream, Sink, Source};
 use std::{
     fs::File,
     io::{self, BufReader, IsTerminal},
@@ -67,7 +67,9 @@ pub fn run(paths: Paths) -> Result<()> {
             frame.render_stateful_widget(List::new(items).block(tui::panel(" Saved voices "))
                 .highlight_style(Style::default().bg(tui::SELECTED).fg(tui::ACCENT)).highlight_symbol("› "),columns[0],&mut selection);
             let detail = profile.map(|speaker| format!("{}\n\n{}\n\nSample: {:.1} seconds\n{}\n\nEnter: listen to this voice\nn: set or change the name\nl: link to an existing speaker\nd: delete this entry · D: delete all unnamed\n\nNaming updates earlier notes and future voice matches. Voice samples are kept separately from full recordings.",speaker.name,
-                if speaker.named { "This voice is named." } else { "Listen, then enter the person's name." }, speaker.sample_seconds,speaker.sample_path))
+                if speaker.id.starts_with("unknown:") {
+                    if speaker.sample_path.is_empty() { "Original recording was not retained." } else { "Unknown turn from the retained recording." }
+                } else if speaker.named { "This voice is named." } else { "Listen, then enter the person's name." }, speaker.sample_seconds,speaker.sample_path))
                 .unwrap_or_else(|| "No speakers yet.\n\nEnable Speaker detection in Config and record speech. A new clear voice gets a short saved sample; very brief or overlapping speech stays unknown.".into());
             frame.render_widget(Paragraph::new(detail).wrap(Wrap { trim:false }).block(tui::panel(" Identify the speaker ")),columns[1]);
             let playing = playback.as_ref().is_some_and(|p| !p.sink.empty());
@@ -204,17 +206,43 @@ pub fn run(paths: Paths) -> Result<()> {
             }
             KeyCode::Enter => {
                 if let Some(profile) = profile {
-                    if profile.sample_path.is_empty() {
-                        message = "Unknown turn has no enrolled sample · press l to link it".into();
-                        continue;
-                    }
                     let start = || -> Result<Playback> {
+                        let (sample_path, start_seconds, duration_seconds) =
+                            if let Some(value) = profile.id.strip_prefix("unknown:") {
+                                let (transcript_id, index) = value
+                                    .rsplit_once(':')
+                                    .context("Invalid unknown speaker turn")?;
+                                let index: usize = index.parse()?;
+                                let entry = History::open(&paths)?
+                                    .list(10000)?
+                                    .into_iter()
+                                    .find(|entry| entry.id == transcript_id)
+                                    .context("Transcript not found")?;
+                                let turn = entry
+                                    .speaker_turns
+                                    .get(index)
+                                    .context("Speaker turn not found")?;
+                                let sample_path = entry
+                                    .audio_path
+                                    .context("Original recording was not retained")?;
+                                (
+                                    sample_path,
+                                    turn.start_seconds,
+                                    turn.end_seconds - turn.start_seconds,
+                                )
+                            } else {
+                                if profile.sample_path.is_empty() {
+                                    anyhow::bail!("This voice has no playable sample");
+                                }
+                                (profile.sample_path.clone(), 0.0, profile.sample_seconds)
+                            };
+                        let source = Decoder::new(BufReader::new(File::open(sample_path)?))?
+                            .skip_duration(Duration::from_secs_f64(start_seconds.max(0.0)))
+                            .take_duration(Duration::from_secs_f64(duration_seconds.max(0.0)));
                         let (stream, handle) =
                             OutputStream::try_default().context("Cannot open audio output")?;
                         let sink = Sink::try_new(&handle)?;
-                        sink.append(Decoder::new(BufReader::new(File::open(
-                            &profile.sample_path,
-                        )?))?);
+                        sink.append(source);
                         Ok(Playback {
                             _stream: stream,
                             sink,
@@ -225,7 +253,7 @@ pub fn run(paths: Paths) -> Result<()> {
                             playback = Some(audio);
                             message.clear();
                         }
-                        Err(error) => message = format!("Cannot play sample: {error:#}"),
+                        Err(error) => message = format!("Cannot play speaker audio: {error:#}"),
                     }
                 }
             }

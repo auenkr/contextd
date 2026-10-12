@@ -350,7 +350,7 @@ impl Service {
         settings: Settings,
         raw: &str,
         refined: &str,
-    ) -> Result<Vec<speakers::SpeakerTurn>> {
+    ) -> Result<(Vec<speakers::SpeakerTurn>, bool)> {
         let engine = self.speaker_engine.clone();
         let paths = self.paths.clone();
         let opts = settings.clone();
@@ -359,6 +359,11 @@ impl Service {
             anyhow::Ok((detection, samples))
         })
         .await??;
+        let existing_speakers: std::collections::HashSet<_> = speakers::list(&self.paths)?
+            .into_iter()
+            .map(|speaker| speaker.id)
+            .collect();
+        let mut new_speaker_detected = false;
         let mut identities = std::collections::HashMap::new();
         for voice in detection.voices {
             let mut clip = Vec::new();
@@ -373,6 +378,12 @@ impl Service {
                 }
             }
             let profile = speakers::identify(&self.paths, &voice.embedding, &clip, &settings)?;
+            if profile
+                .as_ref()
+                .is_some_and(|speaker| !existing_speakers.contains(&speaker.id))
+            {
+                new_speaker_detected = true;
+            }
             identities.insert(voice.local_speaker, profile);
         }
         let locals: std::collections::HashSet<_> = detection
@@ -384,17 +395,20 @@ impl Service {
             let speaker = identities
                 .get(locals.iter().next().unwrap())
                 .and_then(|profile| profile.as_ref());
-            return Ok(vec![speakers::SpeakerTurn {
-                speaker_id: speaker.map(|speaker| speaker.id.clone()),
-                speaker_name: speaker
-                    .map(|speaker| speaker.name.clone())
-                    .unwrap_or_else(|| "Unknown speaker".into()),
-                start_seconds: detection.turns.first().unwrap().start,
-                end_seconds: detection.turns.last().unwrap().end,
-                raw: raw.into(),
-                refined: refined.into(),
-                overlap: false,
-            }]);
+            return Ok((
+                vec![speakers::SpeakerTurn {
+                    speaker_id: speaker.map(|speaker| speaker.id.clone()),
+                    speaker_name: speaker
+                        .map(|speaker| speaker.name.clone())
+                        .unwrap_or_else(|| "Unknown speaker".into()),
+                    start_seconds: detection.turns.first().unwrap().start,
+                    end_seconds: detection.turns.last().unwrap().end,
+                    raw: raw.into(),
+                    refined: refined.into(),
+                    overlap: false,
+                }],
+                new_speaker_detected,
+            ));
         }
         let mut turns = Vec::new();
         for turn in &detection.turns {
@@ -443,7 +457,7 @@ impl Service {
                 overlap,
             });
         }
-        Ok(turns)
+        Ok((turns, new_speaker_detected))
     }
 
     async fn process_at(
@@ -537,27 +551,32 @@ impl Service {
             ));
             return Ok(None);
         }
-        let (speaker_turns, speaker_error) = if settings.speaker_detection_enabled {
+        let (speaker_turns, speaker_error, new_speaker_detected) = if settings
+            .speaker_detection_enabled
+        {
             self.activity(format!("Segment {id}: detecting speakers locally"));
             match self
                 .detect_speakers(samples.clone(), settings.clone(), &raw, &refined)
                 .await
             {
-                Ok(turns) => (turns, None),
+                Ok((turns, new_speaker_detected)) => (turns, None, new_speaker_detected),
                 Err(error) => {
                     let message = format!("Speaker detection failed; complete transcript saved without attribution: {error:#}");
                     let _ = self.events.send(Event::Error {
                         message: message.clone(),
                     });
-                    (Vec::new(), Some(message))
+                    (Vec::new(), Some(message), false)
                 }
             }
         } else {
-            (Vec::new(), None)
+            (Vec::new(), None, false)
         };
         // Queued recording jobs remain recoverable until this entire operation succeeds.
         // Save original and cleaned text together after the model decides what remains.
-        let audio_path = if settings.retain_audio {
+        let audio_path = if settings.retain_audio
+            || new_speaker_detected
+            || speaker_turns.iter().any(|turn| turn.speaker_id.is_none())
+        {
             let path = self.paths.root.join("audio").join(format!("{id}.wav"));
             audio::write_wav(&path, &samples)?;
             Some(path.to_string_lossy().into_owned())

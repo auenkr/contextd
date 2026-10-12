@@ -303,7 +303,7 @@ pub fn unknown_turns(paths: &Paths) -> Result<Vec<Speaker>> {
                         entry.created_at, turn.start_seconds
                     ),
                     named: false,
-                    sample_path: String::new(),
+                    sample_path: entry.audio_path.clone().unwrap_or_default(),
                     created_at: entry.created_at.clone(),
                     sample_seconds: turn.end_seconds - turn.start_seconds,
                 });
