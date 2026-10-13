@@ -28,6 +28,8 @@ This retrains contextd's personalized matching head; it does not fine-tune the d
 
 To compare individual-example matching with the trained centroid head on confirmed links, run `python3 scripts/evaluate_speaker_profiles.py` (use `--threshold 0.82` to mirror the head's minimum score). It uses leave-one-out evaluation and prints aggregate metrics only. This is a useful local regression signal, not an independent benchmark; results need several speakers with repeated, confirmed examples.
 
+To retrain immediately, run `contextd speakers train`. This uses all currently confirmed examples and skips the automatic 10-example and 6-hour gates. If a contextd session is already recording, it can continue; the saved weights are picked up by subsequent scans.
+
 Each normalized embedding is compared with existing profiles using cosine similarity. The default match threshold is `0.75`, with a minimum lead of `0.04` over the next candidate. These are configurable heuristics, not probabilities or a guarantee of identity. Borderline or competing matches remain **Unknown speaker**. Overlapping speech is not used for enrollment. A new profile requires at least two seconds of clear speech and saves at most fifteen seconds as a mono WAV sample.
 
 Names are metadata keyed by the stable ID. Naming updates profile data, affected transcripts and search, then regenerates Markdown. A cached daily grouping plan allows renaming without another model run. A durable synchronization queue retries failed file updates on the next dashboard/server run; `contextd speakers sync` also retries them. If the grouping plan is no longer valid, the original daily view is updated and the daily worker rebuilds the final file. Literal words in the transcript are preserved, including names actually spoken.
@@ -45,6 +47,7 @@ contextd speakers link <duplicate-uuid> <existing-speaker-uuid>
 contextd speakers unknown
 contextd speakers link unknown:<transcript-uuid>:<turn-index> <existing-speaker-uuid>
 contextd speakers sync
+contextd speakers train
 ```
 
 | Setting | Default | Meaning |

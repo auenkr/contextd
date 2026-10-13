@@ -312,6 +312,7 @@ pub fn run(
     };
     let mut recording = false;
     let mut processing = false;
+    let mut exit_deferring = false;
     let mut level = 0.0f32;
     let mut logged_download = (String::new(), 101u64);
     let mut scroll = 0u16;
@@ -480,6 +481,10 @@ pub fn run(
                 "Downloading models"
             } else if setup {
                 "First-run setup"
+            } else if exit_deferring {
+                "Finishing current segment · keeping remaining jobs queued"
+            } else if pending.as_ref().is_some_and(|p| matches!(p.job, Job::Exit)) {
+                "Finishing queued speech before exit"
             } else if pending.is_some() {
                 "Finishing processing"
             } else if recording {
@@ -519,6 +524,13 @@ pub fn run(
                 vec![Span::raw("hjkl / arrows: navigate · "), Span::styled("?: help", Style::default().fg(Color::Yellow)), Span::raw(if setup && !first_run { " · Esc / Backspace: cancel and go back" } else { " · q: cancel and exit" })]
             } else {
                 vec![Span::raw("hjkl / arrows: navigate · "), Span::styled("?: help", Style::default().fg(Color::Yellow)), Span::raw(" · Enter: open · Backspace: back · q / Esc: stop and exit")]
+            };
+            let hints = if exit_deferring {
+                vec![Span::styled("Waiting for the current segment to finish; remaining jobs will resume on next start", Style::default().fg(Color::Yellow))]
+            } else if pending.as_ref().is_some_and(|p| matches!(p.job, Job::Exit)) {
+                vec![Span::raw("Stopping capture and finishing queued speech · press q / Ctrl+C again to leave remaining jobs queued")]
+            } else {
+                hints
             };
             frame.render_widget(Paragraph::new(Line::from(hints)).style(Style::default().fg(tui::MUTED)), rows[3]);
             if help {
@@ -592,6 +604,15 @@ pub fn run(
             || key.code == KeyCode::Backspace && setup && first_run
         {
             if pending.as_ref().is_some_and(|p| matches!(p.job, Job::Exit)) {
+                if !exit_deferring {
+                    service.finish_current_segment_only();
+                    exit_deferring = true;
+                    log(
+                        &mut logs,
+                        Color::Yellow,
+                        "Finishing the current segment; remaining speech will stay queued for next start".into(),
+                    );
+                }
                 continue;
             }
             pending = Some(stop_all(&service, &runtime, &downloads, pending.take()));

@@ -209,4 +209,4 @@ Only successfully structured transcription files expire. Search and individual-n
 
 ## Name a speaker
 
-Open **Speakers** from the dashboard, select an unnamed voice, press Enter to play the sample, and press `n` to enter a name. Enter saves; Esc cancels. Past notes update and future confident matches reuse this name. Press `s` to stop playback and `q` to return. `contextd speakers --json` lists profiles; `contextd speakers name <id> "Name"` names one without opening the screen.
+Open **Speakers** from the dashboard, select an unnamed voice, press Enter to play the sample, and press `n` to enter a name. Enter saves; Esc cancels. Past notes update and future confident matches reuse this name. Press `s` to stop playback and `q` to return. `contextd speakers --json` lists profiles; `contextd speakers name <id> "Name"` names one without opening the screen. Run `contextd speakers train` to immediately retrain the local matching weights from confirmed links.

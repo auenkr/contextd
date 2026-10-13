@@ -118,6 +118,8 @@ enum Command {
 }
 #[derive(Subcommand)]
 enum SpeakerCommand {
+    /// Retrain local speaker matching weights now, regardless of automatic thresholds.
+    Train,
     /// List unknown turns and their linkable IDs.
     Unknown,
     /// Link a duplicate ID or unknown:TRANSCRIPT_ID:TURN_INDEX to an existing speaker.
@@ -233,6 +235,18 @@ async fn main() -> Result<()> {
             Some(command) => match command {
                 Command::Explore => unreachable!("explore is handled before service startup"),
                 Command::Speakers { json, action } => match action {
+                    Some(SpeakerCommand::Train) => {
+                        let paths = service.paths.clone();
+                        let trained = tokio::task::spawn_blocking(move || {
+                            contextd_core::speakers::train_profiles_now(&paths)
+                        })
+                        .await??;
+                        if trained {
+                            println!("Speaker matching weights trained and saved; future scans will use them");
+                        } else {
+                            println!("No confirmed speaker examples are available to train yet; link speaker examples first");
+                        }
+                    }
                     Some(SpeakerCommand::Name { id, name }) => {
                         let paths = service.paths.clone();
                         let settings = service.settings();

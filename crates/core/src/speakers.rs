@@ -369,6 +369,16 @@ pub fn store_unlabeled_examples(
 /// The downloaded WeSpeaker embedding network stays frozen; these class
 /// centroids are the small supervised matching head used by future scans.
 pub fn train_profiles_if_due(paths: &Paths) -> Result<bool> {
+    train_profiles(paths, false)
+}
+
+/// Force a local retraining pass, bypassing the automatic sample-count and
+/// cooldown gates. The caller should run this off the async runtime thread.
+pub fn train_profiles_now(paths: &Paths) -> Result<bool> {
+    train_profiles(paths, true)
+}
+
+fn train_profiles(paths: &Paths, force: bool) -> Result<bool> {
     use rusqlite::OptionalExtension;
     const MIN_NEW_EXAMPLES: i64 = 10;
     const COOLDOWN: chrono::Duration = chrono::Duration::hours(6);
@@ -378,7 +388,7 @@ pub fn train_profiles_if_due(paths: &Paths) -> Result<bool> {
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if new_examples < MIN_NEW_EXAMPLES {
+    if !force && new_examples < MIN_NEW_EXAMPLES {
         return Ok(false);
     }
     let now = chrono::Utc::now();
@@ -389,13 +399,15 @@ pub fn train_profiles_if_due(paths: &Paths) -> Result<bool> {
             |row| row.get(0),
         )
         .optional()?;
-    let cooldown_start = last_trained
-        .or(oldest_new)
-        .context("No speaker examples to train")?;
-    let cooldown_start =
-        chrono::DateTime::parse_from_rfc3339(&cooldown_start)?.with_timezone(&chrono::Utc);
-    if now - cooldown_start < COOLDOWN {
-        return Ok(false);
+    if !force {
+        let cooldown_start = last_trained
+            .or(oldest_new)
+            .context("No speaker examples to train")?;
+        let cooldown_start =
+            chrono::DateTime::parse_from_rfc3339(&cooldown_start)?.with_timezone(&chrono::Utc);
+        if now - cooldown_start < COOLDOWN {
+            return Ok(false);
+        }
     }
 
     let tx = connection.transaction()?;

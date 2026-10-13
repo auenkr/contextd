@@ -73,6 +73,7 @@ pub struct Service {
     processing: std::sync::atomic::AtomicBool,
     recording: std::sync::atomic::AtomicBool,
     daily_worker_started: std::sync::atomic::AtomicBool,
+    finish_current_only: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Service {
     pub fn new() -> Result<Arc<Self>> {
@@ -94,6 +95,7 @@ impl Service {
             processing: std::sync::atomic::AtomicBool::new(false),
             recording: std::sync::atomic::AtomicBool::new(false),
             daily_worker_started: std::sync::atomic::AtomicBool::new(false),
+            finish_current_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         let weak = Arc::downgrade(&service);
         tokio::spawn(async move {
@@ -690,6 +692,8 @@ impl Service {
             bail!("Already listening");
         }
         let settings = self.settings();
+        self.finish_current_only
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         if !models::speech_path(&self.paths, &settings.speech_model)?.exists() {
             bail!("Download {} before listening", settings.speech_model);
         }
@@ -757,8 +761,12 @@ impl Service {
                 }
             }
             let worker_service = service.clone();
+            let finish_current_only = service.finish_current_only.clone();
             let worker = tokio::spawn(async move {
                 while let Some(path) = segments_rx.recv().await {
+                    if finish_current_only.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     let result = async {
                         let job = queue::load(&path)?;
                         worker_service
@@ -894,7 +902,16 @@ impl Service {
             service
                 .recording
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            service.activity("Microphone stopped; queued processing finished");
+            service.activity(
+                if service
+                    .finish_current_only
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    "Microphone stopped; remaining speech is queued for the next start"
+                } else {
+                    "Microphone stopped; queued processing finished"
+                },
+            );
             let _ = service.events.send(Event::Status {
                 recording: false,
                 processing: false,
@@ -914,6 +931,12 @@ impl Service {
             active.done.await?;
         }
         Ok(())
+    }
+    /// On a second exit request, finish the current segment but leave the
+    /// remaining disk-backed jobs for the next contextd start.
+    pub fn finish_current_segment_only(&self) {
+        self.finish_current_only
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
     fn enqueue(
         &self,
